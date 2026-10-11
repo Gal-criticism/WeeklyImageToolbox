@@ -4,6 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from .theme import theme_colors
 
 
 def page_header(title: str, subtitle: str) -> QWidget:
@@ -29,7 +30,7 @@ def icon(name: str) -> QIcon:
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#9680d5"), 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.setPen(QPen(QColor(theme_colors()["accent"]), 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         if name in {"new", "file"}:
             painter.drawRoundedRect(5, 3, 14, 18, 2, 2)
             painter.drawLine(9, 11, 15, 11)
@@ -70,7 +71,8 @@ class Starlight(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        for fraction, y, radius, color in ((.05, 18, 7, "#b5a4df"), (.40, 12, 4, "#aacbea"), (.79, 20, 6, "#b5a4df"), (.95, 10, 3, "#aacbea")):
+        colors = theme_colors()
+        for fraction, y, radius, color in ((.05, 18, 7, colors["accent"]), (.40, 12, 4, colors["secondary"]), (.79, 20, 6, colors["accent"]), (.95, 10, 3, colors["secondary"])):
             x = self.width() * fraction
             path = QPainterPath()
             path.moveTo(x, y - radius)

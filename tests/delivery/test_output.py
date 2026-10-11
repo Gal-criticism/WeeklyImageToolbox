@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from io import BytesIO
 import json
+from pathlib import Path
 from PIL import Image
 
 from galgame_news.domain import ImageCandidate, ImageNeed, ImageType, Issue, NewsItem, PipelineResult, ScoreBreakdown, SourceType
@@ -216,7 +217,7 @@ def _score(relevance: float, total: float) -> ScoreBreakdown:
     )
 
 
-def test_output_exports_all_valid_unselected_images_in_score_order(tmp_path):
+def test_output_exports_reviewable_unselected_images_and_indexes_filtered_originals(tmp_path):
     from galgame_news.delivery.output import OutputManager
 
     item = NewsItem(issue_id="1", sequence=1, section="新作", title="《Game》更新", body="")
@@ -270,7 +271,7 @@ def test_output_exports_all_valid_unselected_images_in_score_order(tmp_path):
         assert selected_image.getpixel((0, 0)) == Image.open(BytesIO(_jpeg_bytes(palette["selected"]))).getpixel((0, 0))
     failure_dir = out / "images" / "x1" / "未候选"
     assert [path.name for path in failure_dir.glob("*.png")] == [
-        f"x1.u{rank:02d}.png" for rank in range(1, 6)
+        f"x1.u{rank:02d}.png" for rank in range(1, 5)
     ]
     with Image.open(failure_dir / "x1.u01.png") as first_unselected:
         assert first_unselected.format == "PNG"
@@ -284,9 +285,13 @@ def test_output_exports_all_valid_unselected_images_in_score_order(tmp_path):
     by_id = {candidate["id"]: candidate for candidate in payload["candidates"]}
     assert by_id[cg_higher.id]["selected"] is False
     assert "未候选" in by_id[cg_higher.id]["local_path"]
+    low_resolution_record = by_id[low_resolution.id]
+    assert "review_assets" in low_resolution_record["local_path"]
+    assert low_resolution_record["signals"]["pending_hidden_reason"] == "low_resolution"
+    assert Path(low_resolution_record["original_path"]).is_file()
 
 
-def test_output_preserves_duplicate_unselected_candidates_for_review(tmp_path):
+def test_output_hides_duplicate_unselected_image_but_indexes_both_originals(tmp_path):
     from galgame_news.delivery.output import OutputManager
 
     item = NewsItem(issue_id="1", sequence=1, section="新作", title="《Game》更新", body="")
@@ -317,5 +322,8 @@ def test_output_preserves_duplicate_unselected_candidates_for_review(tmp_path):
     out = tmp_path / "out"
     OutputManager().write(PipelineResult(issue=issue, candidates=candidates), out)
 
-    assert len(list((out / "images" / "x1" / "未候选").glob("*.png"))) == 2
+    assert len(list((out / "images" / "x1" / "未候选").glob("*.png"))) == 1
     assert sum(candidate.local_path is not None for candidate in candidates) == 2
+    payload = json.loads((out / "image_index.json").read_text(encoding="utf-8"))
+    assert len(payload["candidates"]) == 2
+    assert all(Path(candidate["original_path"]).is_file() for candidate in payload["candidates"])

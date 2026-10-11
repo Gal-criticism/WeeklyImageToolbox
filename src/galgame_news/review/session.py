@@ -8,7 +8,7 @@ import json
 import re
 import shutil
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -30,7 +30,7 @@ from ..domain import (
 from ..delivery.helpers import atomic_json_write, atomic_replace, item_names as canonical_item_names, safe_title
 from ..delivery.image_conversion import ImageConversionError, ImageConverter
 from ..delivery.asset_paths import recover_asset_path, resolve_review_index_root
-from ..curation.review_filter import reviewable_pending_images
+from ..curation.review_filter import SceneComparisonCache, reviewable_pending_images
 
 
 class ReviewDecision(str, Enum):
@@ -47,10 +47,30 @@ class RetryMergeResult:
     attempt_id: str
     added_image_ids: list[str]
     added_video_ids: list[str]
+    diagnostics: list[Any] = field(default_factory=list)
 
     @property
     def added_ids(self) -> list[str]:
         return [*self.added_image_ids, *self.added_video_ids]
+
+
+@dataclass(frozen=True)
+class _PreparedAsset:
+    candidate: Any
+    raw_type: str
+    source: Path | None
+
+
+@dataclass(frozen=True)
+class RetryDelta:
+    news_id: str
+    attempt_id: str
+    images: tuple[_PreparedAsset, ...] = ()
+    videos: tuple[_PreparedAsset, ...] = ()
+    failures: tuple[dict[str, Any], ...] = ()
+    diagnostics: tuple[Any, ...] = ()
+    kind: str = "retry"
+    status: str = "completed"
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -151,6 +171,7 @@ class ReviewSession:
     ):
         self.output_dir = output_dir
         self.task_root = task_root or state_path.parent
+        self.retry_root: Path | None = None
         self.state_path = state_path
         self.images = images
         self.videos = videos
@@ -161,8 +182,13 @@ class ReviewSession:
         self._failed_ids = failed_ids
         self._ambiguous_image_ids = ambiguous_image_ids or set()
         self._decisions: dict[str, ReviewDecision] = {}
+        self._manual_decisions: set[str] = set()
         self._image_by_id = {str(item.id): item for item in images}
         self._video_by_id = {str(item.id): item for item in videos}
+        self.revision = 0
+        self._pending_cache: dict[str, tuple[tuple[Any, ...], tuple[ImageCandidate, ...]]] = {}
+        self._loaded_state_payload: dict[str, Any] = {"schema_version": 1, "decisions": {}, "manual_decisions": []}
+        self._comparison_cache = SceneComparisonCache()
 
     @classmethod
     def from_output(
@@ -183,11 +209,19 @@ class ReviewSession:
             # decision must never create a file inside the legacy directory.
             state = root.parent / f".{root.name}.review_state.json"
 
-        image_payload = _read_json(root / "image_index.json", {})
-        video_payload = _read_json(root / "video_index.json", {})
+        image_payload = cls._read_required_json(root / "image_index.json") if (root / "image_index.json").exists() else {}
+        video_payload = cls._read_required_json(root / "video_index.json") if (root / "video_index.json").exists() else {}
         if not image_payload and not video_payload:
             raise ValueError("审核索引为空或无法读取，请重新选择有效的任务结果目录。")
-        review_payload = _read_json(root / "review_required.json", [])
+        for payload, name, fields in ((image_payload, "图片", ("candidates", "images", "image_candidates")),
+                                      (video_payload, "视频", ("videos", "video_candidates", "candidates"))):
+            if not isinstance(payload, (dict, list)):
+                raise ValueError(f"{name}主索引结构损坏，已保留原文件")
+            if isinstance(payload, dict):
+                for key in (*fields, "news_items", "items"):
+                    if key in payload and not isinstance(payload[key], list):
+                        raise ValueError(f"{name}主索引的 {key} 字段损坏，应为列表，已保留原文件")
+        review_payload = cls._read_required_json(root / "review_required.json") if (root / "review_required.json").exists() else []
         failed_payload = _read_json(root / "failed_items.json", [])
         image_items = _items(image_payload, ("candidates", "images", "image_candidates"))
         video_items = _items(video_payload, ("videos", "video_candidates", "candidates"))
@@ -252,6 +286,14 @@ class ReviewSession:
         )
         session._initialize_decisions()
         return session
+
+    @staticmethod
+    def _read_required_json(path: Path) -> Any:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"无法读取审核数据 {path}: {exc}") from exc
 
     @staticmethod
     def _news_items(
@@ -482,7 +524,12 @@ class ReviewSession:
             self._decisions[str(candidate.id)] = self._initial_image_decision(candidate)
         for candidate in self.videos:
             self._decisions[str(candidate.id)] = self._initial_video_decision(candidate)
-        persisted = self._read_state()
+        state_payload = self._read_state_payload()
+        self._loaded_state_payload = dict(state_payload)
+        self.revision = int(state_payload.get("revision", 0))
+        persisted = state_payload.get("decisions", {})
+        if isinstance(state_payload, dict) and isinstance(state_payload.get("manual_decisions"), list):
+            self._manual_decisions = {str(value) for value in state_payload["manual_decisions"]}
         for media_id, value in persisted.items():
             if media_id in self._decisions and media_id not in self._ambiguous_image_ids:
                 try:
@@ -490,7 +537,9 @@ class ReviewSession:
                 except ValueError:
                     continue
         # Persist initial state so a fresh task has a durable review contract.
-        self._persist()
+        # Initial defaults are persisted only for a new state file.
+        if not self.state_path.exists():
+            self._persist()
 
     def _usable(self, candidate: ImageCandidate | VideoCandidate) -> bool:
         source = self._source_paths.get(str(candidate.id))
@@ -519,37 +568,124 @@ class ReviewSession:
         return ReviewDecision.REJECTED
 
     def _read_state(self) -> dict[str, str]:
-        payload = _read_json(self.state_path, {})
+        return self._read_state_payload().get("decisions", {})
+
+    def _read_state_payload(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {"schema_version": 1, "decisions": {}, "manual_decisions": []}
+        payload = self._read_required_json(self.state_path)
         if not isinstance(payload, dict):
-            return {}
-        values = payload.get("decisions", payload)
-        return values if isinstance(values, dict) else {}
+            raise ValueError(f"审核状态格式错误：{self.state_path} 应为 JSON 对象")
+        values = payload.get("decisions", payload if "manual_decisions" not in payload else {})
+        manual = payload.get("manual_decisions", [])
+        if (not isinstance(values, dict) or not isinstance(manual, list)
+                or any(not isinstance(value, (str, int)) for value in manual)
+                or not isinstance(payload.get("revision", 0), int) or payload.get("revision", 0) < 0):
+            raise ValueError(f"审核状态格式错误：{self.state_path} 的 decisions/manual_decisions 字段无效")
+        for key, value in values.items():
+            if str(value) not in {decision.value for decision in ReviewDecision}:
+                raise ValueError(f"审核状态包含无效决策：{key}={value!r}")
+        if "decisions" not in payload and "manual_decisions" not in payload:
+            return {"schema_version": 1, "decisions": dict(values), "manual_decisions": []}
+        return dict(payload)
 
     def _persist(self) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json_write(
-            self.state_path,
-            {
+        existing = self._read_state_payload()
+        saved = existing.get("decisions", {})
+        decisions = dict(saved) if isinstance(saved, dict) else {}
+        # A review session may load retry batches one at a time. Preserve
+        # decisions for IDs from batches that have not been merged yet.
+        decisions.update({key: value.value for key, value in self._decisions.items()})
+        manual = existing.get("manual_decisions", [])
+        manual_decisions = set(map(str, manual)) if isinstance(manual, list) else set()
+        manual_decisions.update(self._manual_decisions)
+        payload = {
                 "schema_version": 1,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-                "decisions": {key: value.value for key, value in sorted(self._decisions.items())},
-            },
-        )
+                "decisions": {str(key): str(value) for key, value in sorted(decisions.items())},
+                "manual_decisions": sorted(manual_decisions),
+                "revision": self.revision,
+            }
+        self.persist_state_payload(self.state_path, payload)
+        self._loaded_state_payload = payload
+
+    @staticmethod
+    def persist_state_payload(path: Path | str, payload: dict[str, Any]) -> None:
+        path = Path(path)
+        # A corrupted state must never be replaced by an empty/default snapshot.
+        # This check runs in the writer thread for desktop callers.
+        if path.exists():
+            with path.open("r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+            if not isinstance(existing, dict):
+                raise ValueError("审核状态文件结构损坏，已保留原文件")
+            values = existing.get("decisions", existing)
+            if (not isinstance(values, dict) or not isinstance(existing.get("manual_decisions", []), list)
+                    or any(not isinstance(value, (str, int)) for value in existing.get("manual_decisions", []))
+                    or not isinstance(existing.get("revision", 0), int) or existing.get("revision", 0) < 0
+                    or any(str(value) not in {d.value for d in ReviewDecision} for value in values.values())):
+                raise ValueError("审核状态包含损坏的决定记录，已保留原文件")
+        atomic_json_write(Path(path), payload, ensure_parent=True)
+
+    def decision_state_payload(self) -> dict[str, Any]:
+        payload = dict(self._loaded_state_payload)
+        decisions = dict(payload.get("decisions", {}))
+        decisions.update({key: value.value for key, value in self._decisions.items()})
+        manual = set(map(str, payload.get("manual_decisions", []))) | self._manual_decisions
+        payload.update({"schema_version": 1, "decisions": decisions, "manual_decisions": sorted(manual),
+                        "revision": self.revision, "updated_at": datetime.now(timezone.utc).isoformat()})
+        return payload
+
+    def query_snapshot(self) -> "ReviewSession":
+        """Create a lightweight query-only view with independent collections/maps."""
+        snap = object.__new__(ReviewSession)
+        snap.__dict__ = self.__dict__.copy()
+        for name in ("images", "videos", "news_items"):
+            setattr(snap, name, list(getattr(self, name)))
+        for name in ("_source_paths", "_raw_types", "_decisions", "_image_by_id", "_video_by_id"):
+            setattr(snap, name, dict(getattr(self, name)))
+        for name in ("_review_ids", "_failed_ids", "_ambiguous_image_ids", "_manual_decisions"):
+            setattr(snap, name, set(getattr(self, name)))
+        snap._pending_cache = dict(self._pending_cache)
+        snap._comparison_cache = self._comparison_cache
+        return snap
 
     def decision(self, media_id: str) -> ReviewDecision:
         return self._decisions.get(str(media_id), ReviewDecision.REJECTED)
 
     def set_decision(self, media_id: str, decision: ReviewDecision | str) -> None:
-        media_id = str(media_id)
-        if media_id not in self._decisions:
-            raise KeyError(media_id)
-        self._decisions[media_id] = decision if isinstance(decision, ReviewDecision) else ReviewDecision(decision)
-        self._persist()
+        self.set_decisions([media_id], decision)
+
+    def set_decisions(self, media_ids: Iterable[str], decision: ReviewDecision | str, *, persist: bool = True) -> None:
+        selected = decision if isinstance(decision, ReviewDecision) else ReviewDecision(decision)
+        ids = [str(value) for value in media_ids]
+        missing = next((value for value in ids if value not in self._decisions), None)
+        if missing is not None:
+            raise KeyError(missing)
+        changed_news: set[str] = set()
+        changed = False
+        for media_id in ids:
+            if media_id not in self._manual_decisions:
+                changed = True
+            if self._decisions.get(media_id) is not selected:
+                self._decisions[media_id] = selected
+                changed = True
+            self._manual_decisions.add(media_id)
+            candidate = self._image_by_id.get(media_id)
+            if candidate is not None:
+                changed_news.add(str(candidate.news_id))
+        if changed:
+            self.revision += 1
+            for news_id in changed_news:
+                self._pending_cache.pop(news_id, None)
+            if persist:
+                self._persist()
 
     def _sorted_pending(self, values: Iterable[ImageCandidate]) -> list[ImageCandidate]:
         def key(candidate: ImageCandidate):
             score = candidate.score
             return (
+                not (candidate.signals.get("x_api_photo") is True or candidate.signals.get("socialdata_photo") is True),
                 -(score.total if score else 0.0),
                 -(score.source_trust if score else 0.0),
                 -((candidate.width or 0) * (candidate.height or 0)),
@@ -559,12 +695,24 @@ class ReviewSession:
         return sorted(values, key=key)
 
     def pending_images(self, news_id: str | None = None) -> list[ImageCandidate]:
-        values = [candidate for candidate in self.images if self.decision(str(candidate.id)) is ReviewDecision.PENDING]
-        if news_id is not None:
-            values = [candidate for candidate in values if candidate.news_id == news_id]
-        return self._sorted_pending(reviewable_pending_images(
-            values, accepted=self.accepted_images(news_id)
-        ))
+        groups: dict[str, list[ImageCandidate]] = {}
+        for item in self.images:
+            groups.setdefault(str(item.news_id), []).append(item)
+        news_ids = [str(news_id)] if news_id is not None else list(groups)
+        output: list[ImageCandidate] = []
+        for current_news in news_ids:
+            candidates = groups.get(current_news, [])
+            signature = tuple((str(item.id), self.decision(str(item.id)).value, item.sha256, item.perceptual_hash,
+                               item.width, item.height, item.output_sha256, item.local_path, item.original_path,
+                               item.image_type.value if hasattr(item.image_type, "value") else str(item.image_type)) for item in candidates)
+            cached = self._pending_cache.get(current_news)
+            if cached is None or cached[0] != signature:
+                values = [item for item in candidates if self.decision(str(item.id)) is ReviewDecision.PENDING]
+                accepted = [item for item in candidates if self.decision(str(item.id)) is ReviewDecision.ACCEPTED]
+                result = tuple(self._sorted_pending(reviewable_pending_images(values, accepted=accepted, comparison_cache=self._comparison_cache)))
+                self._pending_cache[current_news] = (signature, result)
+            output.extend(self._pending_cache[current_news][1])
+        return self._sorted_pending(output)
 
     def failed_images(self, news_id: str | None = None) -> list[ImageCandidate]:
         values = [candidate for candidate in self.pending_images(news_id) if str(candidate.id) in self._failed_ids or bool(candidate.review_reasons)]
@@ -589,15 +737,15 @@ class ReviewSession:
     def _confined_retry_path(self, news_id: str, attempt_id: str) -> Path:
         """Resolve a retry path while rejecting traversal and symlink escapes."""
 
-        if self.task_root is None:
+        if self.task_root is None and self.retry_root is None:
             raise ValueError("retry merge requires a task_root")
         components = (str(news_id), str(attempt_id))
         for component in components:
             value = Path(component)
             if not component or value.is_absolute() or value.name != component or component in {".", ".."}:
                 raise ValueError("retry path must be a single confined component")
-        retries_root = (Path(self.task_root) / "retries").resolve()
-        lexical = Path(self.task_root) / "retries" / components[0] / components[1]
+        retries_root = Path(self.retry_root).resolve() if self.retry_root is not None else (Path(self.task_root) / "retries").resolve()
+        lexical = retries_root / components[0] / components[1]
         resolved = lexical.resolve()
         try:
             resolved.relative_to(retries_root)
@@ -605,7 +753,177 @@ class ReviewSession:
             raise ValueError("retry path escapes task_root/retries") from exc
         return resolved
 
-    def merge_retry_attempt(self, retry_or_news_id: Any, attempt_id: str | None = None) -> RetryMergeResult:
+    def prepare_retry_delta(self, news_id: str, attempt_id: str, *, legacy_attempt: Any = None) -> RetryDelta:
+        """Read, validate and decode a retry attempt without changing this session."""
+        news_id, attempt_id = str(news_id), str(attempt_id)
+        root = self._confined_retry_path(news_id, attempt_id)
+        if not root.is_dir():
+            raise FileNotFoundError(root)
+        from ..diagnostics import diagnose_error
+        diagnostics: list[Any] = []
+        try:
+            # Older synchronous callers supplied a validated RetryAttempt in
+            # memory. Preserve that interface; a present manifest always wins
+            # and a corrupt file must never be bypassed by an in-memory copy.
+            image_payload = (self._read_required_json(root / "image_index.json")
+                             if (root / "image_index.json").exists() or legacy_attempt is None
+                             else {"candidates": legacy_attempt.images})
+            video_payload = (self._read_required_json(root / "video_index.json") if (root / "video_index.json").exists()
+                             else {"videos": legacy_attempt.videos if legacy_attempt is not None else []})
+        except ValueError as exc:
+            raise ValueError(f"补抓批次索引损坏：{exc}") from exc
+        for payload, keys in ((image_payload, ("candidates", "images", "image_candidates")),
+                              (video_payload, ("videos", "video_candidates", "candidates"))):
+            if not isinstance(payload, (dict, list)):
+                raise ValueError("批次索引结构错误，应为 JSON 对象或旧版列表")
+            if isinstance(payload, dict):
+                for key in keys:
+                    if key in payload and not isinstance(payload[key], list):
+                        raise ValueError(f"批次索引字段 {key} 应为列表")
+        def rows(payload, keys):
+            values = payload if isinstance(payload, list) else next((payload[k] for k in keys if k in payload), [])
+            for raw in values:
+                try:
+                    if not isinstance(raw, dict):
+                        raise ValueError("候选记录不是 JSON 对象")
+                    for key in ("local_path", "original_path", "output_path"):
+                        value = raw.get(key)
+                        if value:
+                            path = Path(value)
+                            path = path if path.is_absolute() else root / path
+                            if self._confine_retry_asset(path) is None:
+                                raise ValueError(f"候选资产路径超出本任务范围：{key}")
+                    yield raw
+                except (OSError, ValueError, TypeError) as exc:
+                    diagnostics.append(diagnose_error(exc, stage="校验补抓候选", source=str(root),
+                        candidate_id=str(raw.get("id", "")) if isinstance(raw, dict) else None))
+        prepared_images: list[_PreparedAsset] = []
+        for raw in rows(image_payload, ("candidates", "images", "image_candidates")):
+            candidate, stable_id = self._coerce_image(raw)
+            if candidate is None or str(candidate.news_id) != news_id:
+                diagnostics.append(diagnose_error(ValueError("图片记录无效或新闻归属不符"), stage="校验补抓候选", candidate_id=stable_id))
+                continue
+            source = self._confine_retry_asset(self._resolve_image_path(candidate, root))
+            if source is not None:
+                expected = candidate.output_sha256 or candidate.sha256
+                try:
+                    if expected and hashlib.sha256(source.read_bytes()).hexdigest().casefold() != str(expected).casefold():
+                        raise ValueError("hash mismatch")
+                    with Image.open(source) as image:
+                        image.verify()
+                    with Image.open(source) as image:
+                        image.load()
+                except Exception as exc:
+                    diagnostics.append(diagnose_error(exc, stage="校验图片", candidate_id=stable_id, source=str(source)))
+                    source = None
+            if source is None:
+                diagnostics.append(diagnose_error(FileNotFoundError("审阅图缺失或校验失败，媒体链接已保留"),
+                                   stage="校验图片", candidate_id=stable_id, source=str(candidate.image_url)))
+                object.__setattr__(candidate, "local_path", None)
+                object.__setattr__(candidate, "original_path", None)
+            else:
+                object.__setattr__(candidate, "local_path", str(source))
+            prepared_images.append(_PreparedAsset(candidate, str(raw.get("image_type", "")).casefold(), source))
+        prepared_videos: list[_PreparedAsset] = []
+        for raw in rows(video_payload, ("videos", "video_candidates", "candidates")):
+            candidate, stable_id = self._coerce_video(raw)
+            if candidate is None or str(candidate.news_id) != news_id:
+                diagnostics.append(f"skipped invalid retry video {stable_id}")
+                continue
+            source = self._confine_retry_asset(self._resolve_asset_path(raw.get("local_path") or raw.get("original_path"), root, candidate.sha256))
+            if source is not None and not source.is_file():
+                source = None
+            if source is None:
+                object.__setattr__(candidate, "local_path", None)
+                diagnostics.append(f"retry video {stable_id} asset unavailable")
+            else:
+                object.__setattr__(candidate, "local_path", str(source))
+            prepared_videos.append(_PreparedAsset(candidate, str(raw.get("media_type", "")).casefold(), source))
+        failure_path = root / "failed_items.json"
+        failure_payload = []
+        if failure_path.exists():
+            try:
+                failure_payload = self._read_required_json(failure_path)
+                if not isinstance(failure_payload, (dict, list)):
+                    raise ValueError("批次失败记录应为 JSON 对象或列表")
+                if isinstance(failure_payload, dict) and not isinstance(failure_payload.get("failures", []), list):
+                    raise ValueError("批次 failures 字段应为列表")
+            except (OSError, ValueError, TypeError) as exc:
+                diagnostics.append(diagnose_error(exc, stage="读取批次失败记录", source=str(failure_path)))
+                failure_payload = []
+        failures = tuple(_items(failure_payload, ("failures",)))
+        if legacy_attempt is not None and not (root / "failed_items.json").exists():
+            failures = tuple(legacy_attempt.failures)
+        metadata = image_payload if isinstance(image_payload, dict) else {}
+        kind = metadata.get("kind", "retry")
+        status = metadata.get("status", "completed")
+        if kind not in {"retry", "supplement"} or status not in {"running", "completed", "partial", "failed", "cancelled"}:
+            raise ValueError("批次抓取类型或状态无效")
+        return RetryDelta(news_id, attempt_id, tuple(prepared_images), tuple(prepared_videos), failures, tuple(diagnostics), kind, status)
+
+    def apply_retry_delta(self, delta: RetryDelta, *, force_pending: bool = False, persist: bool = True) -> RetryMergeResult:
+        added_images: list[str] = []
+        added_videos: list[str] = []
+        changed_news: set[str] = set()
+        recovered: set[str] = set()
+        supplement = force_pending or delta.kind == "supplement"
+        image_urls = {(str(item.news_id), str(item.image_url)) for item in self.images}
+        for entry in delta.images:
+            candidate, source = entry.candidate, entry.source
+            stable_id = str(candidate.id)
+            old = self._image_by_id.get(stable_id)
+            if old is not None:
+                old_source = self._source_paths.get(stable_id)
+                if source is not None and (old_source is None or not old_source.is_file()):
+                    self.images[self.images.index(old)] = candidate
+                    self._image_by_id[stable_id] = candidate
+                    self._source_paths[stable_id] = source
+                    self._raw_types[stable_id] = entry.raw_type
+                    recovered.add(stable_id); changed_news.add(str(candidate.news_id))
+                    if supplement and stable_id not in self._manual_decisions:
+                        self._decisions[stable_id] = ReviewDecision.PENDING
+                continue
+            if (str(candidate.news_id), str(candidate.image_url)) in image_urls:
+                continue
+            image_urls.add((str(candidate.news_id), str(candidate.image_url)))
+            self.images.append(candidate); self._image_by_id[stable_id] = candidate
+            self._raw_types[stable_id] = entry.raw_type
+            if source is not None: self._source_paths[stable_id] = source
+            self._review_ids.add(stable_id)
+            saved = self._loaded_state_payload.get("decisions", {}).get(stable_id)
+            initial = (ReviewDecision.REJECTED if source is None or self._hard_filtered(candidate)
+                       else ReviewDecision.PENDING if supplement
+                       else ReviewDecision.ACCEPTED if candidate.selected
+                       else ReviewDecision.PENDING)
+            self._decisions[stable_id] = ReviewDecision(saved) if saved else initial
+            added_images.append(stable_id); changed_news.add(str(candidate.news_id))
+        for entry in delta.videos:
+            candidate, source = entry.candidate, entry.source
+            stable_id = str(candidate.id)
+            old = self._video_by_id.get(stable_id)
+            if old is not None:
+                old_source = self._source_paths.get(stable_id)
+                if source is not None and (old_source is None or not old_source.is_file()):
+                    self.videos[self.videos.index(old)] = candidate; self._video_by_id[stable_id] = candidate
+                    self._source_paths[stable_id] = source; recovered.add(stable_id); changed_news.add(str(candidate.news_id))
+                continue
+            self.videos.append(candidate); self._video_by_id[stable_id] = candidate
+            if source is not None: self._source_paths[stable_id] = source
+            saved = self._loaded_state_payload.get("decisions", {}).get(stable_id)
+            self._decisions[stable_id] = ReviewDecision(saved) if saved else (ReviewDecision.PENDING if source is not None and supplement else (ReviewDecision.ACCEPTED if source is not None and candidate.status is VideoStatus.DOWNLOADED else ReviewDecision.PENDING if source is not None else ReviewDecision.REJECTED))
+            added_videos.append(stable_id); changed_news.add(str(candidate.news_id))
+        for failure in delta.failures:
+            value = failure.get("candidate_id") or failure.get("id") or failure.get("media_id")
+            if value is not None: self._failed_ids.add(str(value))
+        self._failed_ids.difference_update(recovered)
+        if changed_news:
+            self.revision += 1
+            self._comparison_cache.invalidate(changed_news)
+            for value in changed_news: self._pending_cache.pop(value, None)
+            if persist: self._persist()
+        return RetryMergeResult(delta.news_id, delta.attempt_id, added_images, added_videos, list(delta.diagnostics))
+
+    def merge_retry_attempt(self, retry_or_news_id: Any, attempt_id: str | None = None, *, force_pending: bool = False, persist: bool = True) -> RetryMergeResult:
         """Merge one retry attempt in memory while retaining raw indexes.
 
         ``retry_or_news_id`` may be an attempt directory, a ``RetryAttempt``
@@ -613,67 +931,44 @@ class ReviewSession:
         Existing stable IDs always win; only new records are appended.
         """
 
-        retry_data = None
+        # This compatibility entry point may do disk work. Desktop result
+        # handling uses apply_retry_delta directly and never rereads state.
+        self._loaded_state_payload = self._read_state_payload()
+        self._manual_decisions.update(map(str, self._loaded_state_payload.get("manual_decisions", [])))
         if hasattr(retry_or_news_id, "images") and hasattr(retry_or_news_id, "videos"):
-            retry_data = retry_or_news_id
-            news_id = str(retry_data.news_id)
-            resolved_attempt_id = str(retry_data.attempt_id)
-            root = self._confined_retry_path(news_id, resolved_attempt_id)
-            if Path(retry_data.path).resolve() != root:
-                raise ValueError("retry path is outside task_root/retries")
-            image_items = retry_data.images
-            video_items = retry_data.videos
+            delta = self.prepare_retry_delta(str(retry_or_news_id.news_id), str(retry_or_news_id.attempt_id), legacy_attempt=retry_or_news_id)
+            if getattr(retry_or_news_id, "kind", "retry") == "supplement":
+                delta = RetryDelta(delta.news_id, delta.attempt_id, delta.images, delta.videos, delta.failures, delta.diagnostics, "supplement")
+        elif attempt_id is not None:
+            delta = self.prepare_retry_delta(str(retry_or_news_id), str(attempt_id))
         else:
-            if attempt_id is not None:
-                news_id = str(retry_or_news_id)
-                resolved_attempt_id = str(attempt_id)
-                root = self._confined_retry_path(news_id, resolved_attempt_id)
-            else:
-                raw_path = Path(retry_or_news_id).expanduser()
-                if raw_path.is_absolute():
-                    raise ValueError("retry path must be relative to task_root/retries")
-                root = raw_path.resolve()
-                retries_root = (Path(self.task_root) / "retries").resolve()
-                try:
-                    root.relative_to(retries_root)
-                except ValueError as exc:
-                    raise ValueError("retry path escapes task_root/retries") from exc
-                resolved_attempt_id = root.name
-                news_id = root.parent.name
-            if not root.is_dir():
-                raise FileNotFoundError(root)
-            image_items = _items(_read_json(root / "image_index.json", {}), ("candidates", "images", "image_candidates"))
-            video_items = _items(_read_json(root / "video_index.json", {}), ("videos", "video_candidates", "candidates"))
+            raw_path = Path(retry_or_news_id).expanduser()
+            if raw_path.is_absolute():
+                raise ValueError("retry path must be relative to task_root/retries")
+            retries_root = Path(self.retry_root).resolve() if self.retry_root is not None else (Path(self.task_root) / "retries").resolve()
+            root = raw_path.resolve() if raw_path.is_absolute() else (retries_root / raw_path).resolve()
+            try:
+                relative = root.relative_to(retries_root)
+            except ValueError as exc:
+                raise ValueError("retry path escapes task_root/retries") from exc
+            if len(relative.parts) != 2:
+                raise ValueError("retry path must identify a news and attempt")
+            delta = self.prepare_retry_delta(relative.parts[0], relative.parts[1])
+        return self.apply_retry_delta(delta, force_pending=force_pending, persist=persist)
 
-        added_images: list[str] = []
-        added_videos: list[str] = []
-        for raw in image_items:
-            candidate, stable_id = self._coerce_image(raw)
-            if candidate is None or stable_id in self._image_by_id:
-                continue
-            self.images.append(candidate)
-            self._image_by_id[stable_id] = candidate
-            self._raw_types[stable_id] = str(raw.get("image_type", "")).casefold()
-            source = self._source_path(raw.get("local_path"), root)
-            if source is not None:
-                self._source_paths[stable_id] = source
-            self._review_ids.add(stable_id)
-            self._decisions[stable_id] = self._initial_image_decision(candidate)
-            added_images.append(stable_id)
-        for raw in video_items:
-            candidate, stable_id = self._coerce_video(raw)
-            if candidate is None or stable_id in self._video_by_id:
-                continue
-            self.videos.append(candidate)
-            self._video_by_id[stable_id] = candidate
-            source = self._source_path(raw.get("local_path"), root)
-            if source is not None:
-                self._source_paths[stable_id] = source
-            self._decisions[stable_id] = self._initial_video_decision(candidate)
-            added_videos.append(stable_id)
-        if added_images or added_videos:
-            self._persist()
-        return RetryMergeResult(news_id, resolved_attempt_id, added_images, added_videos)
+    def _confine_retry_asset(self, source: Path | None) -> Path | None:
+        if source is None:
+            return None
+        asset_root = (Path(self.retry_root).resolve().parent if self.retry_root is not None
+                      else Path(self.task_root).resolve() if self.task_root is not None else None)
+        if asset_root is None:
+            return None
+        try:
+            resolved = source.resolve()
+            resolved.relative_to(asset_root)
+        except (OSError, ValueError):
+            return None
+        return resolved
 
     def _folder_names(self) -> dict[str, str]:
         # Use the same canonical naming policy as raw output.  Manifest order

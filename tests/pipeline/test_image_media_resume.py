@@ -6,12 +6,25 @@ import json
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from PIL import Image
 
 from galgame_news.config import load_config
 from galgame_news.domain import CollectionResult, ImageCandidate, Issue, NewsItem, SourceRef, SourceType
 from galgame_news.pipeline import CancellationToken, PipelineRunner, TaskRequest
 from galgame_news.discovery.async_x_api import AsyncSocialDataTweetTransport
+
+
+@pytest.fixture(autouse=True)
+def public_mock_media_dns(monkeypatch):
+    """Mock downloads must not depend on system DNS/proxy addresses."""
+    from galgame_news.pipeline import network_runtime
+    client_class = network_runtime.AsyncHttpClient
+
+    def create_client(**kwargs):
+        return client_class(resolver=lambda _: ["93.184.216.34"], **kwargs)
+
+    monkeypatch.setattr(network_runtime, "AsyncHttpClient", create_client)
 
 
 def fixture(tmp_path, transport):

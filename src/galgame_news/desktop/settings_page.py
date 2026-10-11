@@ -63,12 +63,6 @@ class SettingsPage(QWidget):
         for caption, value in (("跟随系统", "system"), ("浅色", "light"), ("深色", "dark")):
             self.theme_combo.addItem(caption, value)
         self.theme_combo.setCurrentIndex(max(0, self.theme_combo.findData(self._settings.theme)))
-        self.brave_edit = QLineEdit()
-        self.brave_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.x_edit = QLineEdit()
-        self.x_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.twitterapi_edit = QLineEdit()
-        self.twitterapi_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.socialdata_edit = QLineEdit()
         self.socialdata_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.save_button = QPushButton("保存设置")
@@ -89,15 +83,11 @@ class SettingsPage(QWidget):
         browse = QPushButton("选择目录")
         browse.clicked.connect(self.choose_output)
         destination_row.addWidget(browse)
-        secrets = QGroupBox("API 配置")
+        secrets = QGroupBox("X 图片与视频 API（SocialData）")
         secret_form = QFormLayout(secrets)
         secret_form.setVerticalSpacing(12)
-        self._credential_fields = {
-            "brave_api_key": self.brave_edit, "x_bearer_token": self.x_edit,
-            "twitterapi_api_key": self.twitterapi_edit, "socialdata_api_key": self.socialdata_edit,
-        }
-        for name, caption in (("brave_api_key", "Brave 搜索密钥"), ("x_bearer_token", "X 访问凭据"),
-                              ("twitterapi_api_key", "TwitterAPI.io 密钥"), ("socialdata_api_key", "SocialData 密钥")):
+        self._credential_fields = {"socialdata_api_key": self.socialdata_edit}
+        for name, caption in (("socialdata_api_key", "SocialData X 密钥"),):
             edit = self._credential_fields[name]
             edit.setPlaceholderText("留空保留已有密钥")
             row = QHBoxLayout()
@@ -108,9 +98,10 @@ class SettingsPage(QWidget):
             self.credential_status[name] = state
             row.addWidget(state)
             secret_form.addRow(caption, row)
-        hint = QLabel("密钥仅存入 Windows 凭据库，已有内容不回填。SocialData 需在新建任务时单独启用。")
+        hint = QLabel('密钥仅存入 Windows 凭据库，已有内容不回填；留空会保留已有密钥。默认关闭，需在新建任务时单独启用。<a href="https://socialdata.tools/app/api-keys">申请 SocialData API 密钥</a>')
         hint.setWordWrap(True)
         hint.setObjectName("muted")
+        hint.setOpenExternalLinks(True)
         secret_form.addRow(hint)
         self._refresh_credential_status()
         ffmpeg = QGroupBox("视频工具")

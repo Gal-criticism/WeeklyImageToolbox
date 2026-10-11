@@ -10,6 +10,7 @@ def test_socialdata_is_opt_in_per_task_and_included_in_start_request(tmp_path):
     app = QApplication.instance() or QApplication([])
     page = NewTaskPage(default_output=tmp_path / "output")
     page.set_input_path(tmp_path / "261.docx")
+    assert page.section_checkboxes["z"].text() == "周边"
     payloads = []
     page.start_requested.connect(payloads.append)
 

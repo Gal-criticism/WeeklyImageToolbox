@@ -124,6 +124,44 @@ class PipelineRunner:
             return asyncio.run(self.run_async(request, event_sink, cancellation_token))
         raise RuntimeError("Use await runner.run_async() from an active event loop")
 
+    def supplement_news(self, **kwargs):
+        """Collect a reviewer's extra source without rerunning the document."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.supplement_news_async(**kwargs))
+        raise RuntimeError("Use await runner.supplement_news_async() from an active event loop")
+
+    async def supplement_news_async(self, **kwargs):
+        from .supplement import collect_supplement
+        return await collect_supplement(self, kind="supplement", **kwargs)
+
+    async def retry_news_async(
+        self, *, task_root, issue_id, news_id, official_url, news_item=None,
+        request=None, task_id=None, input_path=None, event_sink=None,
+        cancellation_token=None,
+    ):
+        """Collect an official source through the task's async network runtime."""
+        parsed = urlsplit(str(official_url).strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("official_url must be an absolute HTTP(S) URL")
+        root = Path(task_root).expanduser().resolve()
+        if request is None:
+            request = TaskRequest(
+                input_path=input_path or root / "input.docx", issue_id=str(issue_id),
+                output_dir=root, no_videos=True,
+            )
+        if request.issue_id != str(issue_id):
+            raise ValueError("retry issue mismatch")
+        from .supplement import collect_supplement
+        result = await collect_supplement(
+            self, task_root=root, issue_id=issue_id, news_id=news_id,
+            source_url=official_url, news_item=news_item, request=request,
+            task_id=task_id, event_sink=event_sink,
+            cancellation_token=cancellation_token, kind="retry",
+        )
+        return result
+
     async def run_async(self, request, event_sink=None, cancellation_token=None) -> TaskResult:
         from .network_runtime import TaskNetworkRuntime
         if self._network_runtime is not None:
@@ -733,90 +771,23 @@ class PipelineRunner:
         official_url: str,
         task_id: str | None = None,
         input_path: Path | str | None = None,
+        news_item=None,
+        request: TaskRequest | None = None,
+        event_sink=None,
+        cancellation_token=None,
     ) -> str:
-        """Collect one manually supplied official source into a new attempt.
-
-        Retry output is deliberately separate from ``raw``.  The desktop
-        controller reads the returned attempt through ``TaskStore`` and lets
-        ``ReviewSession`` append only previously unseen stable IDs.
-        """
-
-        parsed = urlsplit(str(official_url).strip())
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("official_url must be an absolute HTTP(S) URL")
-        root = Path(task_root).expanduser().resolve()
-        checkpoint_path = root / "checkpoint.json"
-        issue = None
-        if checkpoint_path.is_file():
-            checkpoint = self._load_checkpoint(checkpoint_path)
-            if checkpoint.issue_id != str(issue_id):
-                raise ValueError("retry issue mismatch")
-            issue = checkpoint.issue
-        if issue is not None:
-            news = next((item for item in issue.news_items if item.id == str(news_id)), None)
-        else:
-            news = None
-        if news is None:
-            # Imported legacy output may not have a checkpoint.  Keep this
-            # fallback local to the retry seam; public domain contracts stay
-            # unchanged and only the requested news item is materialized.
-            news = NewsItem(
-                issue_id=str(issue_id), sequence=1, section="新作",
-                title=str(news_id), body="", source_urls=[str(official_url)],
-            )
-            object.__setattr__(news, "id", str(news_id))
-        source = SourceRef(
-            url=str(official_url),
-            source_type=SourceType.OFFICIAL_SITE,
-            domain=str(parsed.hostname or parsed.netloc),
-            discovered_via=DiscoveryMethod.MANUAL,
-            officiality=1.0,
-            root_url=str(official_url),
-        )
-        collection = self._collect(news, source)
-        self._bind_localization_context(news, collection.candidates)
-        failures = list(collection.failures)
-        attempt_id = f"attempt-{uuid.uuid4().hex[:12]}"
-        attempt_root = root / "retries" / str(news_id) / attempt_id
-        attempt_root.mkdir(parents=True, exist_ok=False)
-        accepted, download_failures = ImageDownloader(
-            self.config, transport=self.image_transport,
-        ).download(collection.candidates, attempt_root / "images")
-        failures.extend(download_failures)
-        retry_issue = Issue(
-            issue_id=str(issue_id),
-            input_path=str(input_path or (issue.input_path if issue is not None else "retry")),
-            published_at=issue.published_at if issue is not None else None,
-            news_items=[news],
-        )
-        curated = ImageCurator(self.config).curate(retry_issue, accepted, self.history)
-        failures.extend(curated.failures)
-        retry_candidates = [*curated.candidates, *curated.filtered_candidates]
-        image_payload = {
-            "schema_version": 1,
-            "issue_id": str(issue_id),
-            "news_items": [{
-                "news_id": str(news_id),
-                "sequence": news.sequence,
-                "section": news.section,
-                "title": news.title,
-                "candidates": [str(candidate.id) for candidate in retry_candidates],
-            }],
-            "candidates": [candidate.model_dump(mode="json") for candidate in retry_candidates],
-            "failures": [failure.model_dump(mode="json") for failure in failures],
-        }
-        (attempt_root / "image_index.json").write_text(
-            json.dumps(image_payload, ensure_ascii=False, indent=2), encoding="utf-8",
-        )
-        (attempt_root / "video_index.json").write_text(
-            json.dumps({"schema_version": 1, "issue_id": str(issue_id), "news_items": [], "videos": [], "failures": []}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        (attempt_root / "failed_items.json").write_text(
-            json.dumps([failure.model_dump(mode="json") for failure in failures], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return attempt_id
+        """Synchronous compatibility facade; returns the generated attempt ID."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            result = asyncio.run(self.retry_news_async(
+                task_root=task_root, issue_id=issue_id, news_id=news_id,
+                official_url=official_url, task_id=task_id, input_path=input_path,
+                news_item=news_item, request=request, event_sink=event_sink,
+                cancellation_token=cancellation_token,
+            ))
+            return result.attempt_id
+        raise RuntimeError("Use await runner.retry_news_async() from an active event loop")
 
     def _config_for_request(self, request):
         return load_config(request.config_path) if request.config_path is not None else self.config
@@ -827,9 +798,11 @@ class PipelineRunner:
             self.resolver = self._make_resolver(config)
 
     def _collect(self, news, source, *, request=None):
-        # Translation-specific sources never change x/z collection behavior.
+        # Explicit review additions can reuse the work-aware adapters in any
+        # section; ordinary x/z collection retains its existing behavior.
         host = (urlsplit(source.url).hostname or "").casefold()
-        if self.adapter_factory is None and section_prefix(section_label(news)) == "h" and host in {"vndb.org", "www.vndb.org", "store.steampowered.com"}:
+        use_work_adapter = section_prefix(section_label(news)) == "h" or getattr(self, "_supplement_mode", False)
+        if self.adapter_factory is None and use_work_adapter and host in {"vndb.org", "www.vndb.org", "store.steampowered.com"}:
             from ..localization.service import LocalizationImageService
             # Initialize on the coordinator before parallel source collection.
             service = getattr(self, "_localization_service", None)
@@ -898,6 +871,7 @@ class PipelineRunner:
                 public_transport=self.source_transport,
                 use_socialdata=bool(request and request.use_socialdata_x),
                 response_cache=self._socialdata_response_cache,
+                credential_store=getattr(self, "_supplement_credential_store", None),
                 **kwargs,
             )
             if runtime is not None:

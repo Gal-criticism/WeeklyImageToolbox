@@ -22,6 +22,18 @@ PREFIXES = {1: "x", 2: "z", 3: "h", 4: "x", 5: "z", 6: "h", 7: "z", 8: "z"}
 SELECTIONS = [list(values) for size in (1, 2, 3) for values in combinations("xhz", size)]
 
 
+@pytest.fixture(autouse=True)
+def public_mock_media_dns(monkeypatch):
+    """All network transports in this module are offline fixtures."""
+    from galgame_news.pipeline import network_runtime
+    client_class = network_runtime.AsyncHttpClient
+
+    def create_client(**kwargs):
+        return client_class(resolver=lambda _: ["93.184.216.34"], **kwargs)
+
+    monkeypatch.setattr(network_runtime, "AsyncHttpClient", create_client)
+
+
 def components(tmp_path, rows=ROWS):
     document = tmp_path / "weekly.docx"
     document.write_bytes(b"frozen document stub")

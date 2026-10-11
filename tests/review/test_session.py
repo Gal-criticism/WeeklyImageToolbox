@@ -258,7 +258,11 @@ def test_old_json_is_loaded_defensively_and_deduplicated_by_stable_id(tmp_path):
     }
     (output / "image_index.json").write_text(json.dumps(old), encoding="utf-8")
     (output / "video_index.json").write_text("not-json", encoding="utf-8")
-
+    # Critical corrupt indexes are no longer silently treated as empty.
+    with pytest.raises(ValueError):
+        ReviewSession.from_output(output, state_path=tmp_path / "state.json")
+    assert (output / "video_index.json").read_text(encoding="utf-8") == "not-json"
+    (output / "video_index.json").write_text('{"videos": []}', encoding="utf-8")
     session = ReviewSession.from_output(output, state_path=tmp_path / "state.json")
 
     assert [item.id for item in session.images] == ["legacy-id"]
@@ -295,6 +299,9 @@ def test_retry_merge_adds_new_candidates_without_overwriting_raw_or_duplicates(t
     retry = tmp_path / "task" / "retries" / "n1" / "attempt-1"
     retry.mkdir(parents=True)
     new = _candidate(tmp_path, "new", review=True)
+    retry_source = retry / "new.jpg"
+    retry_source.write_bytes(Path(new["local_path"]).read_bytes())
+    new["local_path"] = str(retry_source)
     (retry / "image_index.json").write_text(
         json.dumps({"schema_version": 1, "news_items": [], "candidates": [old, new]}),
         encoding="utf-8",

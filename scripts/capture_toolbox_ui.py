@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import QApplication
 
 from galgame_news.desktop.controller import DesktopController
@@ -79,6 +79,20 @@ def pump(app, seconds=.35):
         time.sleep(.01)
 
 
+def select_news(review, news_id):
+    root = review.news_list.topLevelItem(0)
+    if news_id is None:
+        review.news_list.setCurrentItem(root)
+        return
+    for group_index in range(root.childCount()):
+        group = root.child(group_index)
+        for index in range(group.childCount()):
+            item = group.child(index)
+            if item.data(0, Qt.ItemDataRole.UserRole) == ("news", news_id):
+                review.news_list.setCurrentItem(item)
+                return
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=ROOT / "output/toolbox_ui_20261002")
@@ -125,16 +139,16 @@ def main():
         review = controller.review_page
         window.navigation.setCurrentRow(2)
         review.tabs.setCurrentIndex(1)
-        review.news_list.setCurrentRow(2)
+        select_news(review, "demo-news-2")
         pump(app, .2)
         window.grab().save(str(shots / f"{theme}-review-failed.png"))
         review.media_list.setCurrentRow(1)
         pump(app, .2)
         window.grab().save(str(shots / f"{theme}-review-invalid.png"))
-        review.news_list.setCurrentRow(3)
+        select_news(review, "demo-news-3")
         pump(app, .2)
         window.grab().save(str(shots / f"{theme}-review-empty.png"))
-        review.news_list.setCurrentRow(0)
+        select_news(review, None)
         review.tabs.setCurrentIndex(0)
         review.raw_toggle.setChecked(True)
         window.resize(1100, 720)

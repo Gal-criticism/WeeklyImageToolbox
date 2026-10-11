@@ -149,7 +149,8 @@ def test_application_dispatches_video_and_dynamic_sources_to_specialized_adapter
 
     fixture = tmp_path / "sample.docx"; fixture.write_bytes(b"fixture")
     Application(parser=Parser(), analyzer=Analyzer(), resolver=Resolver()).run(fixture, issue_id="1", output_dir=tmp_path / "out")
-    assert calls == [("video", SourceType.VIDEO), ("dynamic", SourceType.OFFICIAL_SITE)]
+    # Independent source adapters run concurrently; dispatch order is unspecified.
+    assert sorted(calls) == sorted([("video", SourceType.VIDEO), ("dynamic", SourceType.OFFICIAL_SITE)])
 
 
 def test_application_records_news_result_in_history(tmp_path):

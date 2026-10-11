@@ -55,7 +55,7 @@ def run_fixture(root: Path):
     return runner, result, request, requests
 
 
-def test_formal_download_selection_publication_and_resume(tmp_path):
+def test_formal_publication_keeps_all_localization_assets_and_resumes_selected_final(tmp_path):
     runner, result, request, requests = run_fixture(tmp_path)
     assert result.status == "completed", result.failures
     candidates = result.result.all_candidates
@@ -72,8 +72,12 @@ def test_formal_download_selection_publication_and_resume(tmp_path):
         assert candidate.localization_provenance.source_chain
     assert runner.network_metrics["socialdata_requests"] == 0
     files = list((result.task_dir / "final/images").rglob("*.jpg")) + list((result.task_dir / "final/images").rglob("*.png"))
-    assert len(files) == 6
-    assert any("未候选" in str(path) for path in files)
+    assert len(files) == sum(candidate.selected for candidate in candidates) == 3
+    assert all("未候选" not in str(path) for path in files)
+    raw_index = json.loads((result.task_dir / "raw/image_index.json").read_text(encoding="utf-8"))
+    assert len(raw_index["candidates"]) == 6
+    assert {candidate["id"] for candidate in raw_index["candidates"]} == {candidate.id for candidate in candidates}
+    assert all(Path(candidate["local_path"]).is_file() for candidate in raw_index["candidates"])
     assert len(requests) == 1
     resume = TaskRequest(input_path=request.input_path, issue_id=request.issue_id, output_dir=request.output_dir,
                          no_videos=True, task_dir=result.task_dir, resume=True, images_only=True)

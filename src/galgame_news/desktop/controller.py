@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
+import uuid
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot, QCoreApplication, QElapsedTimer, QTimer
 from PySide6.QtWidgets import QMessageBox
 
 from ..pipeline import CancellationToken, PipelineRunner, ProgressEvent, TaskRequest
@@ -20,7 +22,9 @@ from .progress_page import ProgressPage
 from .review_page import ReviewPage
 from .settings_page import SettingsPage
 from .theme import apply_theme
-from .worker import PipelineWorker
+from .worker import PipelineWorker, ReviewGrabWorker
+from ..diagnostics import diagnose_error, format_error
+from .review_jobs import ReviewQuery
 
 
 class DesktopController(QObject):
@@ -37,7 +41,10 @@ class DesktopController(QObject):
     review_loaded = Signal(object)
     retry_finished = Signal(object)
     retry_failed = Signal(object)
+    supplement_finished = Signal(object)
+    supplement_failed = Signal(object)
     history_changed = Signal()
+    work_changed = Signal()
 
     # Camel-case aliases are useful to Qt-oriented callers while snake-case is
     # the normal Python spelling.
@@ -80,16 +87,28 @@ class DesktopController(QObject):
         self.progress_page.pause_requested.connect(self.pause_task)
         self.progress_page.resume_requested.connect(self.resume_current_task)
         self.progress_page.stop_requested.connect(self.cancel_task)
-        self.history_page.review_requested.connect(self.load_review)
+        self.history_page.review_requested.connect(self._load_review_from_page)
         self.history_page.resume_requested.connect(self.resume_task)
         self.review_page.retry_requested.connect(self._retry_from_page)
-        self.retry_finished.connect(lambda *_: self.review_page.show_retry_result(True))
         self.retry_failed.connect(self.review_page.show_retry_failure)
+        self.review_page.supplement_requested.connect(self.supplement_news)
+        self.review_page.supplement_cancel_requested.connect(self.cancel_supplement)
         self.settings_page.theme_changed.connect(self.apply_theme)
 
         self._thread: QThread | None = None
         self._worker: PipelineWorker | None = None
         self._token: CancellationToken | None = None
+        self._supplement_thread = None
+        self._supplement_worker = None
+        self._supplement_token = None
+        self._supplement_context = None
+        self._supplement_active = False
+        self._grab_result_done = self._grab_thread_done = False
+        self._closing = False
+        self._review_load_generation = 0
+        self._review_loader = ReviewQuery(self)
+        self._review_loader.ready.connect(self._review_load_ready)
+        self._review_loader.idle.connect(self.work_changed)
         self.current_request: TaskRequest | None = None
         self.current_record: TaskRecord | None = None
         self.review_record: TaskRecord | None = None
@@ -112,6 +131,16 @@ class DesktopController(QObject):
     def is_paused(self) -> bool:
         return bool(self._token is not None and self._token.is_paused)
 
+    @property
+    def is_supplement_running(self) -> bool:
+        return self._supplement_active
+
+    @property
+    def has_pending_work(self) -> bool:
+        page = self.review_page
+        return bool(self.is_running or self.is_supplement_running or
+                    self._review_loader.busy or page.exporter.session is not None or page.has_pending_work)
+
     def _start_from_page(self, payload: object) -> bool:
         values = dict(payload) if isinstance(payload, dict) else {}
         return self.start_task(**values)
@@ -132,7 +161,8 @@ class DesktopController(QObject):
         task_dir: Path | str | None = None,
         task_id: str | None = None,
     ) -> bool:
-        if self.is_running:
+        if (self._closing or self.is_running or self.is_supplement_running or self._review_loader.busy
+                or self.review_page.exporter.busy or self.review_page._export_waiting_session is not None):
             return False
         if request is None:
             if input_path is None or issue_id is None or output_dir is None:
@@ -189,7 +219,6 @@ class DesktopController(QObject):
         self._worker.cancelled.connect(self._thread.quit, Qt.ConnectionType.DirectConnection)
         self._worker.failed.connect(self._thread.quit, Qt.ConnectionType.DirectConnection)
         self._thread.finished.connect(self._on_thread_finished)
-        self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
         self.task_started.emit(request)
         self.taskStarted.emit(request)
@@ -353,13 +382,22 @@ class DesktopController(QObject):
             return
         if self._thread is None and self._worker is None and self._token is None:
             return
+        if self._thread is not None and not self._thread.wait(0):
+            QTimer.singleShot(10, self._on_thread_finished)
+            return
         self.progress_page.set_running(False)
         self.new_task_page.set_busy(False)
+        completed_thread = self._thread
         self._thread = None
         self._worker = None
         self._token = None
-        self.history_page.refresh()
-        self.history_changed.emit()
+        if completed_thread is not None:
+            completed_thread.deleteLater()
+        # Closing callers may already have closed the catalog before a queued
+        # thread-finished signal arrives. Only release thread state at shutdown.
+        if not self._closing:
+            self.history_page.refresh()
+            self.history_changed.emit()
 
     def import_output(self, path: str | Path) -> TaskRecord:
         record = self.task_store.import_output(path)
@@ -374,6 +412,9 @@ class DesktopController(QObject):
             QMessageBox.warning(self.new_task_page, "无法导入图片结果", str(exc))
 
     def load_review(self, record: object) -> ReviewSession | None:
+        if (self.is_supplement_running or self.review_page.exporter.busy or self.review_page.state_writer.busy
+                or self.review_page.state_writer.has_failure()):
+            return self.review_page.session
         if not isinstance(record, TaskRecord):
             return None
         self.review_record = record
@@ -400,14 +441,97 @@ class DesktopController(QObject):
                 task_root=export_root,
                 state_path=record.review_state_path,
             )
-        except (OSError, ValueError, TypeError) as exc:
+            session.retry_root = record.root_path / "retries"
+            for attempt in self.task_store.list_retry_attempts(record):
+                try:
+                    session.merge_retry_attempt(attempt, force_pending=attempt.kind == "supplement")
+                except (OSError, ValueError, TypeError) as exc:
+                    self.progress_page.log.appendPlainText(format_error(exc, stage="恢复补抓批次"))
+        except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
             self.review_page.set_session(None)
             self.review_record = None
             QMessageBox.warning(self.review_page, "无法打开图片审核", str(exc))
             return None
         self.review_page.set_session(session)
+        warnings = getattr(self.task_store, "retry_diagnostics", [])
+        if warnings:
+            self.review_page.show_diagnostics(warnings)
         self.review_loaded.emit(session)
         return session
+
+    @Slot(object)
+    def _load_review_from_page(self, record):
+        """History clicks load/validate their indexes off the GUI thread."""
+        if self._closing or self.is_supplement_running or self.review_page.exporter.session is not None:
+            return
+        if not isinstance(record, TaskRecord):
+            return
+        self._review_load_generation += 1
+        self._queue_review_load(record, self._review_load_generation)
+
+    def _queue_review_load(self, record, generation):
+        if self._closing or generation != self._review_load_generation:
+            return
+        if self.review_page.state_writer.busy:
+            QTimer.singleShot(30, lambda: self._queue_review_load(record, generation))
+            return
+        if self.review_page.state_writer.has_failure():
+            self.review_page.operation_status.setText("审核决定尚未保存，请重试保存后再打开其他任务")
+            return
+        self.review_page.operation_status.setText("正在读取索引与校验图片…")
+        identity = (generation, record.task_id)
+        app_data = self.task_store.root
+
+        def load():
+            source = record.source_output_path or (record.root_path / "raw" if (record.root_path / "raw").is_dir() else record.root_path)
+            source = resolve_review_index_root(source)
+            export_root = source.parent if source.name.casefold() == "raw" else record.root_path
+            if record.imported and source.name.casefold() != "raw":
+                export_root = source.parent / f"{source.name}_审核结果"
+            session = ReviewSession.from_output(source, task_root=export_root, state_path=record.review_state_path)
+            session.retry_root = record.root_path / "retries"
+            store = TaskStore(app_data, recover_on_startup=False)
+            try:
+                for attempt in store.list_retry_attempts(record):
+                    try:
+                        session.merge_retry_attempt(attempt, force_pending=attempt.kind == "supplement", persist=False)
+                    except (ValueError, OSError, TypeError) as exc:
+                        store.retry_diagnostics.append(diagnose_error(exc, stage="恢复批次", source=str(attempt.path)))
+                return record, session, list(store.retry_diagnostics)
+            finally:
+                store.close()
+        self._review_loader.request(identity, load)
+        self.work_changed.emit()
+
+    @Slot(object, object, object)
+    def _review_load_ready(self, identity, result, error):
+        if self._closing or identity[0] != self._review_load_generation:
+            return
+        if error is not None:
+            self.review_page.operation_status.setText(format_error(error, stage="载入审核"))
+            self.review_page.show_diagnostics([diagnose_error(error, stage="载入审核")])
+            return
+        if self.review_page.state_writer.busy:
+            QTimer.singleShot(10, self, lambda: self._review_load_ready(identity, result, error))
+            return
+        if self.review_page.state_writer.has_failure():
+            self.review_page.operation_status.setText("审核决定尚未保存，请重试保存后再打开其他任务")
+            return
+        record, session, warnings = result
+        previous = self.review_page.session
+        if previous is not None and previous.state_path == session.state_path:
+            # Loading validates an independent session. Decisions made while
+            # validation ran remain owned by the active GUI session.
+            for decision in set(previous._decisions.values()):
+                ids = [media_id for media_id in previous._manual_decisions
+                       if media_id in session._decisions and previous.decision(media_id) is decision]
+                session.set_decisions(ids, decision, persist=False)
+        self.review_record = record
+        self.review_page.set_session(session)
+        self.review_page.state_writer.enqueue(session)
+        if warnings:
+            self.review_page.show_diagnostics(warnings)
+        self.review_loaded.emit(session)
 
     def _bind_result_task_dir(self, result: object) -> None:
         record = self.current_record
@@ -452,79 +576,183 @@ class DesktopController(QObject):
         )
 
     def retry_news(self, news_id: object, official_url: str | None = None) -> bool:
-        """Retry one news item into an isolated attempt and merge its data."""
-
+        """Start a retry; completion is reported asynchronously via retry_finished."""
         if isinstance(news_id, dict):
             official_url = str(news_id.get("official_url") or official_url or "")
             news_id = news_id.get("news_id") or news_id.get("id")
-        elif isinstance(news_id, (tuple, list)) and len(news_id) >= 1:
-            if len(news_id) > 1 and official_url is None:
-                official_url = str(news_id[1])
-            news_id = news_id[0]
-        news_id = str(news_id or "").strip()
-        official_url = str(official_url or self.review_page.retry_url()).strip()
-        parsed = urlsplit(official_url)
-        record = self.review_record or self.current_record
-        session = self.review_page.session
-        if (
-            not news_id
-            or parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or record is None
-            or session is None
-        ):
+        elif isinstance(news_id, (tuple, list)):
+            official_url = str(news_id[1]) if len(news_id) > 1 and official_url is None else official_url
+            news_id = news_id[0] if news_id else ""
+        return self._start_review_grab("retry", str(news_id or ""),
+                                       str(official_url or self.review_page.retry_url()))
+
+    @Slot(str, str)
+    def supplement_news(self, news_id: str, source_url: str) -> bool:
+        return self._start_review_grab("supplement", news_id, source_url)
+
+    def _start_review_grab(self, kind: str, news_id: str, source_url: str) -> bool:
+        if (self._closing or self.is_running or self.is_supplement_running or self._review_loader.busy
+                or self.review_page.exporter.busy or self.review_page._export_waiting_session is not None):
+            self._show_grab_error(kind, RuntimeError("已有抓取或导出操作正在运行，请稍后重试"))
+            if self.is_supplement_running:
+                self.review_page.set_supplement_busy(True)
             return False
-        runner = self.runner_factory()
-        self._configure_runner_browser(runner)
-        retry = getattr(runner, "retry_news", None)
-        if not callable(retry):
+        record, session = self.review_record or self.current_record, self.review_page.session
+        if record is None or session is None:
+            return False
+        news = next((n for n in session.news_items if str(n.get("news_id")) == str(news_id)), None)
+        parsed = urlsplit(source_url.strip())
+        if news is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            self._show_grab_error(kind, ValueError("请选择具体新闻并输入有效的 HTTP 或 HTTPS 来源链接"))
             return False
         try:
-            attempt = retry(
-                task_root=record.root_path,
-                task_id=record.task_id,
-                issue_id=record.issue_id,
-                news_id=news_id,
-                official_url=official_url,
-                input_path=record.input_path,
-            )
-            attempt_id = getattr(attempt, "attempt_id", None)
-            if attempt_id is None and isinstance(attempt, dict):
-                attempt_id = attempt.get("attempt_id") or attempt.get("id")
-            if attempt_id is None:
-                path = Path(attempt)
-                attempt_id = path.name
-            retry_data = self.task_store.merge_retry_attempt(record, news_id, str(attempt_id))
-            merged = session.merge_retry_attempt(retry_data)
-            self.review_page.refresh()
-            self.retry_finished.emit(merged)
+            options = self.task_store.load_request_options(record)
+            request = TaskRequest(input_path=record.input_path or record.root_path / "input.docx",
+                issue_id=record.issue_id, output_dir=record.root_path, task_id=record.task_id,
+                no_videos=True, offline=bool(options.get("offline", False)),
+                use_socialdata_x=bool(options.get("use_socialdata_x", False)),
+                selected_sections=options.get("selected_sections", ["x", "h", "z"]),
+                config_path=options.get("config_path"), history_db=options.get("history_db"), max_images=options.get("max_images"))
+            runner = self.runner_factory()
+            self._configure_runner_browser(runner)
+            runner._supplement_credential_store = self.credential_store
+            token = CancellationToken()
+            identity = (record.task_id, id(session), uuid.uuid4().hex)
+            kwargs = dict(task_root=record.root_path, task_id=record.task_id,
+                          issue_id=record.issue_id, news_id=str(news_id),
+                          news_item=dict(news), request=request)
+            kwargs["source_url" if kind == "supplement" else "official_url"] = source_url.strip()
+            if kind == "retry":
+                kwargs["input_path"] = record.input_path
+            snapshot = session.query_snapshot()
+            self._supplement_token = token
+            self._supplement_context = (identity, record, session, kind)
+            self._grab_result_done = self._grab_thread_done = False
+            self._supplement_worker = ReviewGrabWorker(runner, kind, kwargs, token, snapshot, identity)
+            self._supplement_thread = QThread(self)
+            self._supplement_worker.moveToThread(self._supplement_thread)
+            self._supplement_thread.started.connect(self._supplement_worker.run)
+            self._supplement_worker.event.connect(self._on_supplement_event)
+            self._supplement_worker.finished.connect(self._on_supplement_finished)
+            self._supplement_worker.failed.connect(self._on_supplement_failed)
+            self._supplement_worker.finished.connect(self._supplement_thread.quit, Qt.ConnectionType.DirectConnection)
+            self._supplement_worker.failed.connect(self._supplement_thread.quit, Qt.ConnectionType.DirectConnection)
+            self._supplement_thread.finished.connect(self._supplement_worker.deleteLater)
+            self._supplement_thread.finished.connect(self._on_supplement_thread_finished)
+            self._supplement_active = True
+            self.review_page.set_supplement_busy(True)
+            self.review_page.supplement_cancel_button.setText("取消抓取")
+            self.review_page.operation_status.setText("正在采集补充来源…" if kind == "supplement" else "正在重试采集新闻…")
+            self.new_task_page.set_busy(True)
+            self._supplement_thread.start()
+            self.work_changed.emit()
             return True
-        except (OSError, TypeError, ValueError, KeyError, RuntimeError) as exc:
-            self.retry_failed.emit(exc)
+        except Exception as exc:
+            self._show_grab_error(kind, exc)
             return False
+
+    def _show_grab_error(self, kind, error):
+        if kind == "retry":
+            self.retry_failed.emit(error)
+        else:
+            self.review_page.show_supplement_failure(error)
+            self.supplement_failed.emit(error)
+
+    @Slot(object)
+    def _on_supplement_event(self, event):
+        if self.sender() is self._supplement_worker and self._supplement_context is not None:
+            self.review_page.operation_status.setText(str(event.message))
+
+    @Slot(object)
+    def _on_supplement_finished(self, value):
+        identity, result, delta = value
+        context = self._supplement_context
+        if context is None or context[0] != identity:
+            return
+        _, record, session, kind = context
+        try:
+            # No manifest reading, hashing or decoding in the GUI coordinator.
+            registration_errors = []
+            try:
+                self.task_store.register_retry_attempt(record, delta.news_id, delta.attempt_id, kind=kind)
+            except sqlite3.Error as exc:
+                # The confined manifest remains durable and can be recovered
+                # as an orphan batch on reopen even if the catalog is locked.
+                registration_errors.append(diagnose_error(exc, stage="登记抓取批次", candidate_id=delta.attempt_id))
+            if self.review_page.session is session and (self.review_record or self.current_record).task_id == identity[0]:
+                self.review_page.operation_status.setText("正在合并新增候选…")
+                merged = session.apply_retry_delta(delta, force_pending=kind == "supplement", persist=False)
+                self.review_page.state_writer.enqueue(session)
+                self.review_page.refresh(preserve_position=True)
+                summary = {"added_count": len(merged.added_image_ids),
+                    "success_count": getattr(result, "success_count", sum(entry.source is not None for entry in delta.images)),
+                    "failed_count": getattr(result, "failed_count", sum(entry.source is None for entry in delta.images)),
+                    "status": getattr(result, "status", delta.status),
+                    "failures": [f.model_dump(mode="json") if hasattr(f, "model_dump") else f
+                                 for f in getattr(result, "failures", delta.failures)]}
+                if kind == "supplement":
+                    self.review_page.show_supplement_result(summary)
+                    self.supplement_finished.emit(summary)
+                else:
+                    self.review_page.show_retry_summary(summary)
+                    self.retry_finished.emit(merged)
+                if delta.diagnostics or registration_errors:
+                    summary_text = self.review_page.operation_status.text()
+                    self.review_page.show_diagnostics([*delta.diagnostics, *registration_errors])
+                    self.review_page.operation_status.setText(summary_text + "；部分资产有诊断，请查看技术详情")
+                self.review_page.set_supplement_busy(True)
+        except Exception as exc:
+            self._show_grab_error(kind, exc)
+        finally:
+            self._grab_result_done = True
+            self._finish_grab_if_ready()
+
+    @Slot(object)
+    def _on_supplement_failed(self, value):
+        identity, error = value
+        if self._supplement_context is None or self._supplement_context[0] != identity:
+            return
+        self._show_grab_error(self._supplement_context[3], error)
+        self.review_page.set_supplement_busy(True)
+        self._grab_result_done = True
+        self._finish_grab_if_ready()
+
+    @Slot()
+    def cancel_supplement(self):
+        if self._supplement_token is not None:
+            self._supplement_token.cancel()
+            self.review_page.operation_status.setText("正在取消抓取，保留已下载图片…")
+
+    @Slot()
+    def _on_supplement_thread_finished(self):
+        if self.sender() is not self._supplement_thread:
+            return
+        self._grab_thread_done = True
+        self._finish_grab_if_ready()
+
+    def _finish_grab_if_ready(self):
+        if not (self._grab_result_done and self._grab_thread_done):
+            return
+        if self._supplement_thread is not None and not self._supplement_thread.wait(0):
+            QTimer.singleShot(10, self._finish_grab_if_ready)
+            return
+        completed_thread = self._supplement_thread
+        self._supplement_active = False
+        self._supplement_thread = self._supplement_worker = self._supplement_token = None
+        self._supplement_context = None
+        if completed_thread is not None:
+            completed_thread.deleteLater()
+        self.review_page.set_supplement_busy(False)
+        self.new_task_page.set_busy(self.is_running)
+        self.work_changed.emit()
 
     @Slot(str)
     def _retry_from_page(self, news_id: str) -> bool:
-        """Give UI retries an outcome even when the public API returns early."""
-
-        failures = []
-
-        def note_failure(error):
-            failures.append(error)
-
-        self.retry_failed.connect(note_failure, Qt.ConnectionType.DirectConnection)
-        try:
-            success = self.retry_news(news_id)
-            if not success and not failures:
-                self.review_page.show_retry_result(False)
-            return success
-        except Exception as exc:
-            # Runner construction happens before retry_news's exception block.
-            # Route that UI failure through the existing diagnostic signal.
-            self.retry_failed.emit(exc)
-            return False
-        finally:
-            self.retry_failed.disconnect(note_failure)
+        before = self.review_page.operation_status.text()
+        started = self.retry_news(news_id)
+        if not started and self.review_page.operation_status.text() == before:
+            self.review_page.show_retry_result(False)
+        return started
 
     def apply_theme(self, theme: str) -> str:
         return apply_theme(theme)
@@ -543,11 +771,24 @@ class DesktopController(QObject):
         self.history_page.refresh()
 
     def close(self, timeout_ms: int = 1000) -> bool:
-        if self.is_running:
-            self.cancel_task()
-            if not self.wait_for_task(timeout_ms):
-                self.persist_state()
-                return False
+        self._closing = True
+        self.review_page.begin_close()
+        self._review_load_generation += 1
+        self._review_loader.invalidate()
+        self.cancel_supplement()
+        self.cancel_task()
+        # Normal window closing calls with zero timeout and polls asynchronously.
+        # Legacy callers may request a bounded wait, while queued completion and
+        # state-write signals still get delivered on the GUI thread.
+        timer = QElapsedTimer()
+        timer.start()
+        while self.has_pending_work and timer.elapsed() < max(0, timeout_ms):
+            QCoreApplication.processEvents()
+            QThread.msleep(1)
+        if self.has_pending_work or self.review_page.state_writer.has_failure():
+            return False
+        self._review_loader.pool.close()
+        self.review_page.finish_close()
         self.persist_state()
         return True
 

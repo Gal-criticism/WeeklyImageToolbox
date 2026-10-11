@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, QEvent
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QVBoxLayout,
@@ -13,10 +13,12 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QStackedWidget,
     QWidget,
+    QApplication,
 )
 
 from .controller import DesktopController
 from .ui import icon
+from .resources import CharacterArt, configure_branding
 
 
 class MainWindow(QMainWindow):
@@ -25,7 +27,8 @@ class MainWindow(QMainWindow):
     def __init__(self, controller: DesktopController | None = None, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("mainWindow")
-        self.setWindowTitle("Galgame 新闻工具箱")
+        self.setWindowTitle("周报图片采集工具箱")
+        self.setWindowIcon(configure_branding(QApplication.instance()))
         self.resize(1280, 820)
         self.setMinimumSize(1100, 720)
         self.controller = controller or DesktopController(parent=self)
@@ -44,6 +47,9 @@ class MainWindow(QMainWindow):
         self.settings_page = self.controller.settings_page
         self._close_pending = False
         self._close_signals_connected = False
+        self._close_timer = QTimer(self)
+        self._close_timer.setInterval(30)
+        self._close_timer.timeout.connect(self._finish_deferred_close)
         for page in (self.new_task_page, self.progress_page, self.review_page, self.history_page, self.settings_page):
             self.pages.addWidget(page)
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
@@ -53,7 +59,8 @@ class MainWindow(QMainWindow):
         sidebar.setFixedWidth(192)
         side = QVBoxLayout(sidebar)
         side.setContentsMargins(16, 26, 16, 18)
-        brand = QLabel("Galgame\n新闻工具箱")
+        side.addWidget(CharacterArt(154, 90), alignment=Qt.AlignmentFlag.AlignHCenter)
+        brand = QLabel("周报图片\n采集工具箱")
         brand.setObjectName("brand")
         side.addWidget(brand)
         tagline = QLabel("采集 · 筛选 · 审阅")
@@ -75,11 +82,18 @@ class MainWindow(QMainWindow):
         self.controller.task_started.connect(lambda *_: self.navigation.setCurrentRow(1))
         self.controller.review_loaded.connect(lambda *_: self.navigation.setCurrentRow(2))
 
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange) and hasattr(self, "navigation"):
+            for index, symbol in enumerate(("new", "progress", "review", "history", "settings")):
+                if (item := self.navigation.item(index)) is not None:
+                    item.setIcon(icon(symbol))
+
     def _connect_deferred_close(self) -> None:
         if self._close_signals_connected:
             return
         self._close_signals_connected = True
-        for signal in (self.controller.task_finished, self.controller.task_cancelled, self.controller.task_failed, self.controller.history_changed):
+        for signal in (self.controller.task_finished, self.controller.task_cancelled, self.controller.task_failed, self.controller.history_changed, self.controller.work_changed):
             signal.connect(self._schedule_deferred_close)
 
     def _schedule_deferred_close(self, *_args) -> None:
@@ -87,7 +101,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._finish_deferred_close)
 
     def _finish_deferred_close(self) -> None:
-        if self._close_pending and not self.controller.is_running:
+        if self._close_pending and self.controller.close(timeout_ms=0):
+            self._close_timer.stop()
             self._close_pending = False
             self.close()
 
@@ -95,17 +110,13 @@ class MainWindow(QMainWindow):
         if self._close_pending:
             event.ignore()
             return
-        if self.controller.is_running:
+        if self.controller.close(timeout_ms=0):
+            event.accept()
+        else:
             self._close_pending = True
             self._connect_deferred_close()
-            if self.controller.close():
-                self._close_pending = False
-                event.accept()
-            else:
-                event.ignore()
-            return
-        self.controller.close(timeout_ms=0)
-        event.accept()
+            self._close_timer.start()
+            event.ignore()
 
 
 __all__ = ["MainWindow"]

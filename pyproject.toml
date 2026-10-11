@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "galgame-news"
-version = "0.2.0"
+version = "1.0.0"
 requires-python = ">=3.11"
 dependencies = [
   "pydantic>=2.7,<3",
@@ -36,6 +36,9 @@ browser = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"galgame_news.desktop" = ["assets/*.png", "assets/*.ico"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

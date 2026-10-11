@@ -1,0 +1,69 @@
+name: Windows release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-v1.0.0
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Check release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          if ($version -eq '1.0.0' -and ( '${{ github.event_name }}' -eq 'workflow_dispatch' -or '${{ github.ref }}' -eq 'refs/heads/main')) { 'is_release=true' >> $env:GITHUB_OUTPUT } else { 'is_release=false' >> $env:GITHUB_OUTPUT }
+      - name: Stop when this is not the v1.0.0 release
+        if: steps.version.outputs.is_release != 'true'
+        run: echo "No v1.0.0 release is configured for this revision."
+      - name: Install locked dependencies
+        if: steps.version.outputs.is_release == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r packaging/requirements-release.lock
+          python -m pip install --no-deps -e .
+      - name: Run tests
+        if: steps.version.outputs.is_release == 'true'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest
+      - name: Build fresh release ZIP
+        if: steps.version.outputs.is_release == 'true'
+        run: python packaging/release.py --output-dir release-output
+      - name: Validate release artifact
+        if: steps.version.outputs.is_release == 'true'
+        run: python packaging/release.py --verify release-output/WeeklyImageToolbox-v1.0.0-windows-x64.zip
+      - name: Create draft release and upload artifact
+        if: steps.version.outputs.is_release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v1.0.0 *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'Release v1.0.0 already exists; refusing to overwrite it.' }
+          gh release create v1.0.0 release-output/WeeklyImageToolbox-v1.0.0-windows-x64.zip release-output/WeeklyImageToolbox-v1.0.0-windows-x64.zip.sha256 --draft --target $env:GITHUB_SHA --title 'Weekly Image Toolbox v1.0.0' --notes 'Windows x64 portable release. See bundled README and third-party notices.'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create draft GitHub release.' }
+          gh release download v1.0.0 --pattern 'WeeklyImageToolbox-v1.0.0-windows-x64.zip*' --dir downloaded-release
+          if ($LASTEXITCODE -ne 0) { throw 'Could not retrieve uploaded release asset.' }
+          $expected = (Get-Content downloaded-release/WeeklyImageToolbox-v1.0.0-windows-x64.zip.sha256 -Raw).Split(' ')[0].Trim()
+          $actual = (Get-FileHash downloaded-release/WeeklyImageToolbox-v1.0.0-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw 'Uploaded ZIP did not match its SHA-256 sidecar.' }
+          python packaging/release.py --verify downloaded-release/WeeklyImageToolbox-v1.0.0-windows-x64.zip
+          if ($LASTEXITCODE -ne 0) { throw 'Uploaded release ZIP failed verification.' }
+          gh release edit v1.0.0 --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish verified release as Latest.' }

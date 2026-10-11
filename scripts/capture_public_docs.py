@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import tempfile
 import time
@@ -52,13 +53,15 @@ def pump(app: QApplication, seconds: float = .3) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "docs/assets/screenshots")
+    parser.add_argument("--theme", choices=("light", "dark"), default="light")
+    parser.add_argument("--temp-root", type=Path)
     args = parser.parse_args()
     destination = args.output.resolve()
     destination.mkdir(parents=True, exist_ok=True)
 
     app = QApplication.instance() or QApplication([])
-    apply_theme("light", app)
-    with tempfile.TemporaryDirectory(prefix="galgame-public-docs-") as temp_name:
+    apply_theme(args.theme, app)
+    with tempfile.TemporaryDirectory(prefix="galgame-public-docs-", dir=args.temp_root) as temp_name:
         temp = Path(temp_name)
         raw = temp / "fixture" / "raw"
         raw.mkdir(parents=True)
@@ -95,7 +98,7 @@ def main() -> None:
             new.offline_checkbox.setChecked(True)
             # Let the real form's scroll area use the full page height so all
             # options, including SocialData, are visible in the public shot.
-            new.layout().takeAt(new.layout().count() - 1)
+            # The form already gives its scroll area the remaining height.
             controller.import_output(raw)
             if (review_session := controller.review_page.session) is not None:
                 # The review footer normally shows real on-disk paths. For this
@@ -116,7 +119,7 @@ def main() -> None:
                     controller.history_page.task_list.item(row).setText(label)
             controller.settings_page.output_edit.setText("output")
             controller.settings_page.theme_combo.setCurrentIndex(
-                controller.settings_page.theme_combo.findData("light")
+                controller.settings_page.theme_combo.findData(args.theme)
             )
             progress = controller.progress_page
             progress.set_running(True)
@@ -127,11 +130,11 @@ def main() -> None:
                                                     total_news=2, message=message))
             review = controller.review_page
             review.tabs.setCurrentIndex(0)
-            review.news_list.setCurrentRow(0)
+            review.news_list.setCurrentItem(review.news_list.topLevelItem(0))
             review.media_list.setCurrentRow(0)
             review.retry_url_edit.setText("https://example.test/news/demo")
 
-            window.resize(1440, 960)
+            window.resize(1280, 960)
             window.show()
             pump(app)
             page_files = [(0, "new-task.png"), (1, "progress.png"), (2, "review.png"),
@@ -140,31 +143,34 @@ def main() -> None:
                 window.navigation.setCurrentRow(index)
                 if name == "review.png":
                     review.tabs.setCurrentIndex(0)
-                    review.news_list.setCurrentRow(0)
+                    review.news_list.setCurrentItem(review.news_list.topLevelItem(0))
                     review.media_list.setCurrentRow(0)
                 pump(app, .6 if name == "review.png" else .25)
                 window.grab().save(str(destination / name))
 
-        # The overview is an explicitly labeled, three-panel montage.
+            # Five labeled panels, including the main workflow and settings.
             images = [Image.open(destination / filename).convert("RGB") for filename in
-                  ("progress.png", "history.png", "settings.png")]
+                  ("new-task.png", "progress.png", "review.png", "history.png", "settings.png")]
             panel_w, panel_h, label_h, gap = 600, 386, 54, 20
-            overview = Image.new("RGB", (gap + 3 * (panel_w + gap), panel_h + label_h + 2 * gap), "#e8edf3")
+            overview = Image.new("RGB", (gap + 3 * (panel_w + gap), 2 * (panel_h + label_h + gap) + gap), "#242832" if args.theme == "dark" else "#FFF7F3")
             draw = ImageDraw.Draw(overview)
             font_path = Path("C:/Windows/Fonts/msyh.ttc")
             font = ImageFont.truetype(str(font_path), 26) if font_path.exists() else ImageFont.load_default()
-            for i, (image, title) in enumerate(zip(images, ("抓取进度", "历史任务", "设置"))):
-                x = gap + i * (panel_w + gap)
-                draw.text((x + 8, gap), title, font=font, fill="#263448")
+            for i, (image, title) in enumerate(zip(images, ("新建任务", "抓取进度", "图片审核", "历史任务", "设置"))):
+                x = gap + (i % 3) * (panel_w + gap)
+                y = gap + (i // 3) * (panel_h + label_h + gap)
+                draw.text((x + 8, y), title, font=font, fill="#F5EFEA" if args.theme == "dark" else "#303747")
                 thumb = image.resize((panel_w, panel_h), Image.Resampling.LANCZOS)
-                overview.paste(thumb, (x, gap + label_h))
+                overview.paste(thumb, (x, y + label_h))
             overview.save(destination / "overview.png")
 
         finally:
+            controller.close(timeout_ms=5000)
             if window is not None:
                 window.close()
             controller.task_store.close()
             pump(app, .1)
+            gc.collect()  # release short-lived SQLite context connections
 
 
 if __name__ == "__main__":

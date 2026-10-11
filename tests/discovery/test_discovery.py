@@ -340,6 +340,15 @@ def test_fallback_search_combines_providers_for_explicit_cg_updates():
     assert len(result) == 6
 
 
+def test_default_fallback_search_does_not_use_brave_environment_key(monkeypatch):
+    from galgame_news.discovery.search import FallbackSearchProvider
+
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "legacy-key")
+    ddgs = type("DDGS", (), {"search": lambda self, _news: []})()
+    provider = FallbackSearchProvider(ddgs=ddgs)
+    assert provider.brave is None
+
+
 def test_ddgs_provider_passes_bounded_timeout_to_client(monkeypatch):
     from types import SimpleNamespace
     import sys

@@ -5,7 +5,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QSize, QThreadPool, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QSize, QThreadPool, Qt, Signal, Slot, QTimer
+from .review_jobs import _retire
 from PySide6.QtGui import QImage, QImageReader
 
 
@@ -25,6 +26,7 @@ class _Decode(QRunnable):
     def __init__(self, generation: int, request: ImageRequest):
         super().__init__()
         self.generation, self.request = generation, request
+        self.setAutoDelete(False)
         self.signals = _Result()
 
     def run(self) -> None:
@@ -63,6 +65,7 @@ class AsyncImages(QObject):
         self.generation = 0
         self._pending: OrderedDict[str, ImageRequest] = OrderedDict()
         self._running: dict[tuple[int, str], _Decode] = {}
+        self._retired = []
 
     @property
     def pending_count(self) -> int:
@@ -70,7 +73,7 @@ class AsyncImages(QObject):
 
     @property
     def running_count(self) -> int:
-        return len(self._running)
+        return max(len(self._running), self.pool.activeThreadCount())
 
     def invalidate(self) -> int:
         self.generation += 1
@@ -100,16 +103,20 @@ class AsyncImages(QObject):
         while self._pending and len(self._running) < 2:
             _, request = self._pending.popitem(last=False)
             job = _Decode(self.generation, request)
+            job.signals.setParent(self)
             self._running[(self.generation, request.key)] = job
             job.signals.done.connect(self._done, Qt.ConnectionType.QueuedConnection)
             self.pool.start(job)
 
     @Slot(int, object, object, str)
     def _done(self, generation: int, request: ImageRequest, image: QImage, error: str) -> None:
-        self._running.pop((generation, request.key), None)
+        job = self._running.pop((generation, request.key), None)
+        if job is not None:
+            self._retired.append(job)
         if generation == self.generation:
             self.ready.emit(generation, request, image, error)
         self._pump()
+        QTimer.singleShot(0, self, lambda: _retire(self))
 
 
 __all__ = ["AsyncImages", "ImageRequest"]

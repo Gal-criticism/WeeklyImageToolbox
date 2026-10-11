@@ -111,6 +111,7 @@ class RetryAttempt:
     images: list[dict[str, Any]]
     videos: list[dict[str, Any]]
     failures: list[dict[str, Any]]
+    kind: str = "retry"
 
     @property
     def candidates(self) -> list[dict[str, Any]]:
@@ -125,7 +126,7 @@ class TaskStore:
     root.
     """
 
-    def __init__(self, app_data: Path | str | None = None):
+    def __init__(self, app_data: Path | str | None = None, *, recover_on_startup: bool = True):
         if app_data is None:
             local_app_data = os.environ.get("LOCALAPPDATA")
             base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
@@ -136,17 +137,19 @@ class TaskStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.tasks_root.mkdir(parents=True, exist_ok=True)
         self.catalog_path = self.root / "task_catalog.sqlite3"
-        self._connection = sqlite3.connect(self.catalog_path)
+        self._connection = sqlite3.connect(self.catalog_path, timeout=0.1)
         self._connection.row_factory = sqlite3.Row
         self._initialize_catalog()
+        self.retry_diagnostics: list[dict[str, Any]] = []
         # Run only at startup, never during an active worker's directory switch.
-        from ..pipeline.compact_output import recover_interrupted_compaction
-        for record in self.list_tasks():
-            if not record.imported:
-                try:
-                    recover_interrupted_compaction(record.root_path, task_id=record.task_id)
-                except (OSError, ValueError):
-                    pass  # Leave all data untouched for a later recovery.
+        if recover_on_startup:
+            from ..pipeline.compact_output import recover_interrupted_compaction
+            for record in self.list_tasks():
+                if not record.imported:
+                    try:
+                        recover_interrupted_compaction(record.root_path, task_id=record.task_id)
+                    except (OSError, ValueError):
+                        pass  # Leave all data untouched for a later recovery.
 
     def _initialize_catalog(self) -> None:
         self._connection.executescript(
@@ -177,7 +180,7 @@ class TaskStore:
     @staticmethod
     def _initialize_task_state(path: Path, record: TaskRecord) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
+        connection = sqlite3.connect(path, timeout=0.1)
         try:
             connection.executescript(
                 """
@@ -209,6 +212,29 @@ class TaskStore:
                 "INSERT INTO task_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 values.items(),
             )
+            connection.commit()
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _ensure_task_state_schema(path: Path) -> None:
+        """Upgrade older managed task state files before retry access."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path, timeout=0.1)
+        try:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS task_meta (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS retry_attempts (
+                    news_id TEXT NOT NULL, attempt_id TEXT NOT NULL, path TEXT NOT NULL,
+                    created_at TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'retry',
+                    PRIMARY KEY(news_id, attempt_id));
+                CREATE TABLE IF NOT EXISTS review_decisions (
+                    media_id TEXT PRIMARY KEY, decision TEXT NOT NULL, updated_at TEXT NOT NULL);
+            """)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(retry_attempts)")}
+            if "kind" not in columns:
+                connection.execute("ALTER TABLE retry_attempts ADD COLUMN kind TEXT NOT NULL DEFAULT 'retry'")
             connection.commit()
         finally:
             connection.close()
@@ -464,6 +490,36 @@ class TaskStore:
             raise ValueError("retry path escapes task retries directory") from exc
         return resolved_path
 
+    @staticmethod
+    def _valid_retry_component(value: str, label: str) -> str:
+        value = str(value)
+        if not value or value in {".", ".."} or Path(value).name != value or "/" in value or "\\" in value:
+            raise ValueError(f"invalid retry {label}")
+        return value
+
+    def register_retry_attempt(self, task: TaskRecord | str, news_id: str, attempt_id: str,
+                               kind: str = "retry", path: Path | str | None = None) -> Path:
+        """Register a completed batch using only SQLite and confined path checks.
+
+        Intentionally does not inspect or hash manifests; safe to call on the GUI thread.
+        """
+        record = task if isinstance(task, TaskRecord) else self.get_task(str(task))
+        if record is None:
+            raise KeyError(f"unknown task: {task}")
+        news_id = self._valid_retry_component(news_id, "news id")
+        attempt_id = self._valid_retry_component(attempt_id, "attempt id")
+        retries = Path(record.task_root) / "retries"
+        attempt = self._confined(Path(path) if path is not None else retries / news_id / attempt_id, retries)
+        state_path = Path(record.state_path or Path(record.task_root) / "task_state.sqlite3")
+        self._ensure_task_state_schema(state_path)
+        with sqlite3.connect(state_path, timeout=0.1) as connection:
+            connection.execute(
+                "INSERT INTO retry_attempts(news_id, attempt_id, path, created_at, kind) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(news_id, attempt_id) DO UPDATE SET path=excluded.path, kind=excluded.kind",
+                (news_id, attempt_id, str(attempt), datetime.now(timezone.utc).isoformat(), str(kind or "retry")),
+            )
+        return attempt
+
     def merge_retry_attempt(self, task: TaskRecord | str, news_id: str, attempt_id: str) -> RetryAttempt:
         """Read one retry attempt as data without mutating raw output.
 
@@ -474,8 +530,10 @@ class TaskStore:
         record = task if isinstance(task, TaskRecord) else self.get_task(str(task))
         if record is None:
             raise KeyError(f"unknown task: {task}")
+        state_path = Path(record.state_path or Path(record.task_root) / "task_state.sqlite3")
+        self._ensure_task_state_schema(state_path)
         retries = Path(record.task_root) / "retries"
-        attempt = self._confined(retries / str(news_id) / str(attempt_id), retries)
+        attempt = self._confined(retries / self._valid_retry_component(news_id, "news id") / self._valid_retry_component(attempt_id, "attempt id"), retries)
         if not attempt.is_dir():
             raise FileNotFoundError(attempt)
         image_payload = _read_json(attempt / "image_index.json", {})
@@ -483,6 +541,8 @@ class TaskStore:
         images = self._items(image_payload, ("candidates", "images", "image_candidates"))
         videos = self._items(video_payload, ("videos", "video_candidates", "candidates"))
         failures = self._items(image_payload, ("failures",)) + self._items(video_payload, ("failures",))
+        manifest = image_payload if isinstance(image_payload, dict) else {}
+        kind = str(manifest.get("kind") or manifest.get("attempt_kind") or "retry")
         retry = RetryAttempt(
             task_id=record.task_id,
             news_id=str(news_id),
@@ -491,18 +551,127 @@ class TaskStore:
             images=images,
             videos=videos,
             failures=failures,
+            kind=kind,
         )
-        state_path = Path(record.state_path or Path(record.task_root) / "task_state.sqlite3")
-        connection = sqlite3.connect(state_path)
-        try:
-            connection.execute(
-                "INSERT OR REPLACE INTO retry_attempts(news_id, attempt_id, path, created_at) VALUES (?, ?, ?, ?)",
-                (retry.news_id, retry.attempt_id, str(attempt), datetime.now(timezone.utc).isoformat()),
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        self.register_retry_attempt(record, retry.news_id, retry.attempt_id, kind, attempt)
         return retry
+
+    def list_retry_attempts(self, task: TaskRecord | str) -> list[RetryAttempt]:
+        """Reload every registered retry batch in stable creation order."""
+        from ..diagnostics import diagnose_error
+        self.retry_diagnostics = []
+        record = task if isinstance(task, TaskRecord) else self.get_task(str(task))
+        if record is None:
+            raise KeyError(f"unknown task: {task}")
+        state_path = Path(record.state_path or Path(record.task_root) / "task_state.sqlite3")
+        self._ensure_task_state_schema(state_path)
+        # A run can be interrupted after publishing its manifest but before the
+        # GUI registers the completed batch. Recover only valid supplement
+        # manifests directly under this task's confined retries directory.
+        retries_root = (Path(record.task_root) / "retries").resolve()
+        if retries_root.is_dir():
+            for index_path in sorted(retries_root.glob("*/*/image_index.json")):
+                try:
+                    attempt = self._confined(index_path.parent, retries_root)
+                    directory_news_id = self._valid_retry_component(attempt.parent.name, "news id")
+                    attempt_id = self._valid_retry_component(attempt.name, "attempt id")
+                    with sqlite3.connect(state_path, timeout=0.1) as connection:
+                        registered = connection.execute("SELECT 1 FROM retry_attempts WHERE news_id=? AND attempt_id=?", (directory_news_id, attempt_id)).fetchone()
+                    if registered is not None:
+                        continue
+                    payload = self._load_retry_manifest(index_path)
+                    kind = str(payload.get("kind") or payload.get("attempt_kind") or "")
+                    if kind not in {"supplement", "retry"}:
+                        continue
+                    if not self._valid_supplement(payload, directory_news_id, attempt):
+                        self.retry_diagnostics.append(diagnose_error(ValueError("invalid retry batch"), "retry_list", source=str(index_path), candidate_id=attempt_id))
+                        continue
+                    self.register_retry_attempt(record, directory_news_id, attempt_id, kind, attempt)
+                except Exception as error:
+                    self.retry_diagnostics.append(diagnose_error(error, "retry_list", source=str(index_path), candidate_id=index_path.parent.name))
+        with sqlite3.connect(state_path, timeout=0.1) as connection:
+            rows = connection.execute(
+                "SELECT news_id, attempt_id, path, kind FROM retry_attempts ORDER BY created_at, attempt_id"
+            ).fetchall()
+        result = []
+        for news_id, attempt_id, raw_path, kind in rows:
+            try:
+                news_id = self._valid_retry_component(news_id, "news id")
+                attempt_id = self._valid_retry_component(attempt_id, "attempt id")
+                attempt = self._confined(Path(raw_path), retries_root)
+                if attempt.parent.name != news_id or attempt.name != attempt_id:
+                    raise ValueError("retry batch path does not match its catalog ids")
+                if not attempt.is_dir():
+                    raise FileNotFoundError(attempt)
+                image_payload = self._load_retry_manifest(attempt / "image_index.json")
+                video_path = attempt / "video_index.json"
+                video_payload = self._load_retry_manifest(video_path, optional=True)
+                self._validate_manifest(image_payload, "image")
+                self._validate_manifest(video_payload, "video")
+                result.append(RetryAttempt(
+                    record.task_id, str(news_id), str(attempt_id), attempt,
+                    self._validated_retry_items(image_payload, ("candidates", "images", "image_candidates"), news_id, attempt),
+                    self._validated_retry_items(video_payload, ("videos", "video_candidates", "candidates"), news_id, attempt),
+                    self._items(image_payload, ("failures",)) + self._items(video_payload, ("failures",)),
+                    str(kind or "retry"),
+                ))
+            except Exception as error:
+                self.retry_diagnostics.append(diagnose_error(error, "retry_list", source=raw_path, candidate_id=str(attempt_id)))
+        return result
+
+    @staticmethod
+    def _load_retry_manifest(path: Path, optional: bool = False) -> dict[str, Any]:
+        if optional and not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise ValueError("retry manifest must be a JSON object")
+        return payload
+
+    @staticmethod
+    def _validate_manifest(payload: dict[str, Any], kind: str) -> None:
+        version = payload.get("schema_version", payload.get("schemaVersion"))
+        if version is not None and version not in (1, "1"):
+            raise ValueError(f"unsupported retry {kind} manifest schema")
+        for key in (("candidates", "images", "image_candidates", "failures") if kind == "image" else ("videos", "video_candidates", "candidates", "failures")):
+            if key in payload and not isinstance(payload[key], list):
+                raise ValueError(f"retry manifest {key} must be a list")
+
+    def _validated_retry_items(self, payload, keys, news_id, attempt):
+        from ..diagnostics import diagnose_error
+        rows = next((payload[key] for key in keys if isinstance(payload.get(key), list)), [])
+        result = []
+        for row in rows:
+            try:
+                if not isinstance(row, dict):
+                    raise ValueError("候选记录必须为 JSON 对象")
+                if str(row.get("news_id") or row.get("newsId") or "") != str(news_id):
+                    raise ValueError("候选记录所属新闻与批次不一致")
+                for key in ("local_path", "original_path", "output_path"):
+                    value = row.get(key)
+                    if value:
+                        path = Path(value)
+                        self._confined(path if path.is_absolute() else attempt / path, attempt.parents[2])
+                result.append(row)
+            except (OSError, TypeError, ValueError) as exc:
+                self.retry_diagnostics.append(diagnose_error(exc, stage="恢复候选", source=str(attempt),
+                    candidate_id=str(row.get("id", "")) if isinstance(row, dict) else None))
+        return result
+
+    @classmethod
+    def _valid_supplement(cls, payload: dict[str, Any], news_id: str, attempt: Path) -> bool:
+        cls._validate_manifest(payload, "image")
+        rows = payload.get("news_items")
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict) or str(rows[0].get("news_id", rows[0].get("newsId", ""))) != news_id:
+            return False
+        image_candidates = cls._items(payload, ("candidates", "images", "image_candidates"))
+        video_payload = cls._load_retry_manifest(attempt / "video_index.json", optional=True)
+        cls._validate_manifest(video_payload, "video")
+        candidates = image_candidates + cls._items(video_payload, ("videos", "video_candidates", "candidates"))
+        # A batch containing only foreign news cannot be recovered as this
+        # news. Mixed batches retain valid rows and isolate foreign records.
+        return not candidates or any(str(item.get("news_id") or item.get("newsId") or "") == news_id for item in candidates)
 
     def read_retry_attempt(self, task: TaskRecord | str, news_id: str, attempt_id: str) -> RetryAttempt:
         return self.merge_retry_attempt(task, news_id, attempt_id)
