@@ -12,7 +12,7 @@ SPEC_ROOT = Path(SPECPATH).resolve()
 PROJECT_ROOT = SPEC_ROOT.parent
 SRC_ROOT = PROJECT_ROOT / "src"
 # PyInstaller appends .exe to this name on Windows.
-TARGET_EXECUTABLE = "GalgameNewsToolbox.exe"
+TARGET_EXECUTABLE = "WeeklyImageToolbox.exe"
 EXCLUDED_OPTIONAL_MODULES = [
     # Keep the packaged desktop binding unambiguous: the application uses
     # PySide6, and Anaconda may otherwise make PyInstaller discover every Qt
@@ -38,6 +38,7 @@ EXCLUDED_OPTIONAL_MODULES = [
 
 def _data_files() -> list[tuple[str, str]]:
     data: list[tuple[str, str]] = []
+    data.append((str(SRC_ROOT / "galgame_news" / "desktop" / "assets"), "galgame_news/desktop/assets"))
     default_config = PROJECT_ROOT / "config" / "default.toml"
     if default_config.is_file():
         data.append((str(default_config), "config"))
@@ -74,7 +75,9 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="GalgameNewsToolbox",
+    name="WeeklyImageToolbox",
+    icon=str(SRC_ROOT / "galgame_news" / "desktop" / "assets" / "toolbox.ico"),
+    version=str(SPEC_ROOT / "version_info.txt"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -97,5 +100,5 @@ coll = COLLECT(
     # the frozen package location's bundle root, while PyInstaller 6 defaults
     # supporting files to ``_internal``.
     contents_directory=".",
-    name="GalgameNewsToolbox",
+    name="WeeklyImageToolbox",
 )

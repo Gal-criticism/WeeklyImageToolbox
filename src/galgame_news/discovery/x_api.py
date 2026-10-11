@@ -1,8 +1,7 @@
-"""TwitterAPI.io transport used to recover image media from X posts."""
+"""Opt-in SocialData factory and explicitly injectable legacy transports."""
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Callable
 from urllib.parse import urlsplit
@@ -14,28 +13,6 @@ from ..settings.credentials import CredentialStore
 
 _API_BASE = "https://api.twitterapi.io"
 _STATUS_ID = re.compile(r"/(?:i/web/)?status/(\d+)(?:/|$)", re.IGNORECASE)
-
-
-def _configured_tokens() -> tuple[str | None, str | None]:
-    """Resolve TwitterAPI.io and X API tokens without reading plain settings."""
-
-    twitterapi_key = next((
-        os.environ.get(name, "").strip()
-        for name in ("TWITTERAPI_KEY", "TWITTERAPI_IO_KEY")
-        if os.environ.get(name, "").strip()
-    ), None)
-    x_bearer_token = os.environ.get("X_BEARER_TOKEN", "").strip() or None
-    if twitterapi_key and x_bearer_token:
-        return twitterapi_key, x_bearer_token
-    try:
-        store = CredentialStore()
-        return (
-            twitterapi_key or store.get_twitterapi_api_key(),
-            x_bearer_token or store.get_x_bearer_token(),
-        )
-    except Exception:
-        # Headless CLI installs may not include the optional keyring package.
-        return twitterapi_key, x_bearer_token
 
 
 class TwitterApiIoMediaTransport:
@@ -160,16 +137,11 @@ def create_x_adapter(*, public_transport=None, public_resolver=None, use_sociald
             public_timeout=4.0,
         )
 
-    twitterapi_key, x_bearer_token = _configured_tokens()
-    token = twitterapi_key or x_bearer_token
-    transport = (
-        TwitterApiIoMediaTransport() if twitterapi_key
-        else XApiV2MediaTransport() if x_bearer_token
-        else None
-    )
     return XAdapter(
-        token=token,
-        transport=transport,
+        # Legacy transports remain available for explicit callers, but are
+        # never selected from environment variables or saved credentials.
+        token=None,
+        transport=None,
         public_transport=public_transport,
         public_resolver=public_resolver,
         public_timeout=4.0,

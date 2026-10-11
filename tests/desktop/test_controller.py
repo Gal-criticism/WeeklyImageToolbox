@@ -354,5 +354,8 @@ def test_controller_retry_merges_one_news_attempt_without_overwriting_raw(qtbot,
     assert session is not None
 
     assert controller.retry_news("news-1", "https://official.example/retry") is True
+    qtbot.waitUntil(lambda: not controller.is_supplement_running, timeout=3000)
     assert [str(item.id) for item in session.images] == ["old", "new"]
     assert (raw / "image_index.json").read_bytes() == before
+    assert controller.close(5000)
+    store.close()

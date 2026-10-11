@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from .ui import page_header, Starlight, icon
+from .resources import CharacterArt
 
 
 class NewTaskPage(QWidget):
@@ -35,6 +36,7 @@ class NewTaskPage(QWidget):
         self.input_edit.setPlaceholderText("将 DOCX 拖到这里，或点击选择文件")
         self.input_edit.setObjectName("inputPathEdit")
         browse = QPushButton("选择文件")
+        self.input_browse_button = browse
         browse.setIcon(icon("file"))
         browse.clicked.connect(self.choose_input)
         input_row = QHBoxLayout()
@@ -54,7 +56,7 @@ class NewTaskPage(QWidget):
         self.offline_checkbox = QCheckBox("离线模式：仅使用本地及已索引的来源")
         self.no_videos_checkbox = QCheckBox("跳过视频，仅抓取图片")
         self.no_videos_checkbox.setChecked(True)
-        self.socialdata_checkbox = QCheckBox("本次任务使用 SocialData 获取 X 媒体")
+        self.socialdata_checkbox = QCheckBox("本次使用 X 图片与视频 API（SocialData）")
         self.socialdata_checkbox.setToolTip("默认关闭；启用后按帖子查询，密钥从凭据库读取。")
         self.socialdata_checkbox.setObjectName("useSocialDataXCheckbox")
         self.section_checkboxes = {
@@ -85,10 +87,13 @@ class NewTaskPage(QWidget):
         self.drop_hint.setObjectName("muted")
 
         drop_group = QGroupBox("周报文档")
-        drop_layout = QVBoxLayout(drop_group)
-        drop_layout.addWidget(Starlight())
-        drop_layout.addWidget(self.drop_hint)
-        drop_layout.addLayout(input_row)
+        drop_layout = QHBoxLayout(drop_group)
+        drop_form = QVBoxLayout()
+        drop_form.addWidget(Starlight())
+        drop_form.addWidget(self.drop_hint)
+        drop_form.addLayout(input_row)
+        drop_layout.addLayout(drop_form, 1)
+        drop_layout.addWidget(CharacterArt(200, 154))
         destination = QGroupBox("任务信息")
         form = QFormLayout(destination)
         form.setVerticalSpacing(14)
@@ -127,7 +132,11 @@ class NewTaskPage(QWidget):
         actions.addStretch()
         actions.addWidget(self.start_button)
         layout.addLayout(actions)
-        layout.addStretch(1)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange) and hasattr(self, "input_browse_button"):
+            self.input_browse_button.setIcon(icon("file"))
 
     @staticmethod
     def infer_issue(path: Path | str) -> str:

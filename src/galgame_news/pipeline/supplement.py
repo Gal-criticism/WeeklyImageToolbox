@@ -14,7 +14,7 @@ from ..curation import ImageCurator, ImageDownloader
 from ..delivery.helpers import atomic_json_write
 from ..delivery.output import OutputManager
 from ..discovery.resolver import DefaultSourceResolver, _normalize
-from ..domain import DiscoveryMethod, FailureRecord, FailureStage, ImageCandidate, ImageCurationStatus, Issue, NewsItem, SourceType
+from ..domain import DiscoveryMethod, FailureRecord, FailureStage, ImageCandidate, ImageCurationStatus, Issue, NewsItem, SourceRef, SourceType
 from .contracts import CancellationRequested, CancellationToken, ProgressEvent, TaskRequest
 from .download_state import DownloadJournal
 from .network_runtime import TaskNetworkRuntime
@@ -41,6 +41,16 @@ class SupplementResult:
     def added_images(self):
         return [str(c.id) for c in self.candidates]
 
+    @property
+    def status_counts(self):
+        return {
+            "selected": sum(bool(c.selected) for c in self.candidates),
+            "downloaded": sum(c.download_status == "downloaded" for c in self.candidates),
+            "pending": sum(c.download_status == "pending" for c in self.candidates),
+            "retryable_failed": sum(c.download_status == "retryable_failed" for c in self.candidates),
+            "permanent_failed": sum(c.download_status == "permanent_failed" for c in self.candidates),
+        }
+
 
 def _read(path, default):
     if not path.is_file():
@@ -48,14 +58,31 @@ def _read(path, default):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _news(root, issue_id, news_id, news_item):
-    checkpoint = _read(root / "checkpoint.json", {})
+def _news(root, issue_id, news_id, news_item, *, strict_checkpoint=False):
+    checkpoint_path = root / "checkpoint.json"
+    if strict_checkpoint:
+        if checkpoint_path.is_file():
+            # Present checkpoints are critical task state and must validate.
+            from .checkpoint import load_checkpoint
+            checked = load_checkpoint(checkpoint_path)
+            checkpoint = checked.model_dump(mode="json")
+        else:
+            # Imported task folders may have no checkpoint. Use only a real
+            # NewsItem supplied by the caller; never synthesize display data.
+            checkpoint = {}
+    else:
+        checkpoint = _read(checkpoint_path, {})
     if checkpoint and checkpoint.get("issue_id") != issue_id:
         raise ValueError("补抓任务期号与检查点不一致")
     data = next((n for n in checkpoint.get("issue", {}).get("news_items", []) if n.get("id") == news_id), None)
     if data is None and isinstance(news_item, NewsItem):
+        if strict_checkpoint and (news_item.id != news_id or news_item.issue_id != issue_id):
+            raise ValueError("retry news item identity mismatch")
         data = news_item.model_dump(mode="json")
     if data is None and isinstance(news_item, dict):
+        if strict_checkpoint and (str(news_item.get("news_id") or news_item.get("id") or "") != news_id
+                                  or not news_item.get("title") or not news_item.get("section")):
+            raise ValueError("重试缺少当前新闻的真实标题、栏目或标识")
         data = dict(news_item)
         data.pop("news_id", None)
         data.pop("candidates", None)
@@ -67,39 +94,79 @@ def _news(root, issue_id, news_id, news_item):
     if data is None:
         raise ValueError("未找到当前新闻的标题与栏目，无法补抓")
     news = NewsItem.model_validate(data)
+    if news.issue_id != issue_id:
+        raise ValueError("retry news item issue mismatch")
     if news.id != news_id:
         object.__setattr__(news, "id", news_id)
     return news.model_copy(deep=True), checkpoint
 
 
-def _prior_candidates(root, news_id, source_url):
+def _prior_candidates(root, news_id, source_url, kind):
     """Reuse only indexed assets belonging to this task and this news."""
     records = []
-    payload = _read(root / "raw" / "image_index.json", {})
-    records.extend(payload.get("candidates", []))
-    attempts = sorted((root / "retries" / news_id).glob("*/image_index.json"), key=lambda p: p.stat().st_mtime_ns)
+    diagnostics = []
+    raw_index = root / "raw" / "image_index.json"
+    payload = _read(raw_index, {})
+    if not isinstance(payload, dict) or not isinstance(payload.get("candidates", []), list):
+        raise ValueError(f"invalid critical raw image index: {raw_index}")
+    records.extend(("raw", value) for value in payload.get("candidates", []))
+    attempts_root = (root / "retries" / news_id).resolve()
+    attempts = sorted(attempts_root.glob("*/image_index.json"), key=lambda p: p.stat().st_mtime_ns) if attempts_root.is_dir() else []
     prior_sources = None
     for path in attempts:
-        payload = _read(path, {})
-        records.extend(payload.get("candidates", []))
-        if payload.get("kind") == "supplement" and payload.get("source_url") == source_url:
-            prior_sources = payload.get("sources", [])
+        if not path.resolve().is_relative_to(root):
+            continue
+        try:
+            payload = _read(path, {})
+            if not isinstance(payload, dict) or payload.get("kind") != kind:
+                continue
+            batch_records = payload.get("candidates", [])
+            if not isinstance(batch_records, list):
+                raise ValueError("candidate list is not an array")
+            records.extend((str(path), value) for value in batch_records)
+            if payload.get("source_url") == source_url:
+                candidate_sources = payload.get("sources", [])
+                if not isinstance(candidate_sources, list):
+                    raise ValueError("source list is not an array")
+                try:
+                    prior_sources = [SourceRef.model_validate(value) for value in candidate_sources]
+                except Exception as exc:
+                    prior_sources = None
+                    diagnostics.append(FailureRecord(stage=FailureStage.COLLECT,
+                        news_id=news_id, code="prior_retry_batch_invalid",
+                        message=f"历史来源记录已跳过（{type(exc).__name__}）",
+                        source_url=source_url, retryable=False))
+        except Exception as exc:
+            diagnostics.append(FailureRecord(stage=FailureStage.COLLECT,
+                news_id=news_id, code="prior_retry_batch_invalid",
+                message=f"历史重试批次已跳过（{type(exc).__name__}）",
+                source_url=source_url, retryable=False))
     by_id = {}
-    for raw in records:
-        if raw.get("news_id") != news_id:
-            continue
-        candidate = ImageCandidate.model_validate(raw)
-        if any(value and not Path(value).resolve().is_relative_to(root) for value in (candidate.local_path, candidate.original_path)):
-            continue
-        old = by_id.get(candidate.id)
-        if old is None or ImageDownloader.reusable(candidate) or not ImageDownloader.reusable(old):
-            by_id[candidate.id] = candidate
-    return by_id, prior_sources
+    for batch, raw in records:
+        try:
+            if not isinstance(raw, dict):
+                raise ValueError("candidate entry is not an object")
+            if raw.get("news_id") != news_id:
+                continue
+            candidate = ImageCandidate.model_validate(raw)
+            if any(value and not Path(value).resolve().is_relative_to(root) for value in (candidate.local_path, candidate.original_path)):
+                continue
+            old = by_id.get(candidate.id)
+            if old is None or ImageDownloader.reusable(candidate) or not ImageDownloader.reusable(old):
+                by_id[candidate.id] = candidate
+        except Exception as exc:
+            diagnostics.append(FailureRecord(stage=FailureStage.COLLECT,
+                news_id=news_id, code="prior_candidate_invalid",
+                message=f"历史候选记录已跳过（{type(exc).__name__}）",
+                source_url=source_url, retryable=False))
+    return by_id, prior_sources, diagnostics
 
 
 async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url,
                              news_item=None, request=None, task_id=None,
-                             event_sink=None, cancellation_token=None):
+                             event_sink=None, cancellation_token=None, kind="supplement"):
+    if kind not in {"supplement", "retry"}:
+        raise ValueError("unknown review collection kind")
     if runner._network_runtime is not None:
         raise RuntimeError("本任务已有抓取操作正在运行")
     root = Path(task_root).resolve()
@@ -107,7 +174,7 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
     if not news_id or Path(news_id).name != news_id or news_id in {".", ".."} or ":" in news_id:
         raise ValueError("新闻标识不合法")
     source_url = _normalize(str(source_url).strip())
-    news, checkpoint = _news(root, issue_id, news_id, news_item)
+    news, checkpoint = _news(root, issue_id, news_id, news_item, strict_checkpoint=kind == "retry")
     request = request or TaskRequest(input_path=root / "input.docx", issue_id=issue_id, output_dir=root, no_videos=True)
     if request.issue_id != issue_id:
         raise ValueError("补抓请求与任务期号不一致")
@@ -131,10 +198,10 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
     runner._network_runtime = runtime
     runner._localization_service = None
     old_supplement_mode = getattr(runner, "_supplement_mode", False)
-    runner._supplement_mode = True
+    runner._supplement_mode = kind == "supplement"
     old_journal = runner._download_journal
     failures, candidates, sources = [], [], []
-    attempt_id = f"supplement-{uuid.uuid4().hex[:12]}"
+    attempt_id = f"{kind}-{uuid.uuid4().hex[:12]}"
     attempt_root = root / "retries" / news_id / attempt_id
     status = "running"
     sink = event_sink or (lambda event: None)
@@ -146,7 +213,7 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
 
     def save():
         atomic_json_write(attempt_root / "image_index.json", {
-            "schema_version": 1, "kind": "supplement", "source_url": source_url,
+            "schema_version": 1, "kind": kind, "source_url": source_url,
             "status": status, "issue_id": issue_id,
             "news_items": [{"news_id": news_id, "title": news.title, "sequence": news.sequence, "section": news.section}],
             "sources": [s.model_dump(mode="json") for s in sources],
@@ -159,7 +226,8 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
     try:
         # The public client validates even a source supplied to an injected adapter.
         await runtime.call_sync(lambda: runtime.page_client.validate_url(source_url))
-        prior, prior_sources = await runtime.call_sync(lambda: _prior_candidates(root, news_id, source_url))
+        prior, prior_sources, prior_failures = await runtime.call_sync(lambda: _prior_candidates(root, news_id, source_url, kind))
+        failures.extend(prior_failures)
         cache_identity = (checkpoint.get("input_sha256") or hashlib.sha256(str(root).encode()).hexdigest(),
                           checkpoint.get("config_sha256") or runner._config_hash(config, request))
         runner._download_journal = DownloadJournal(root, Issue(issue_id=issue_id, input_path=str(request.input_path), news_items=[news]), *cache_identity)
@@ -171,9 +239,8 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
         # No search or history expansion: navigation is anchored to the extra URL.
         resolver = DefaultSourceResolver(same_domain_depth=config.search.same_domain_depth,
             search_provider=lambda item: [], history_lookup=lambda item: [])
-        from ..domain import SourceRef
         if prior_sources is not None:
-            sources = [SourceRef.model_validate(s) for s in prior_sources]
+            sources = prior_sources
         elif runner.adapter_factory is not None:
             sources = [resolver._document_source(source_url)]
         else:
@@ -191,7 +258,8 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
         news.source_urls = list(dict.fromkeys([*original_urls, source_url]))
         object.__setattr__(news, "id", news_id)
         attempt_root.mkdir(parents=True, exist_ok=False)
-        candidates = [c.model_copy(deep=True) for c in prior.values() if c.signals.get("supplement_source_url") == source_url] if prior_sources is not None else []
+        provenance_key = "supplement_source_url" if kind == "supplement" else "retry_source_url"
+        candidates = [c.model_copy(deep=True) for c in prior.values() if c.signals.get(provenance_key) == source_url] if prior_sources is not None else []
         if not candidates:
             emit("正在采集补充图片…")
             collections = await runtime.collect_many(news, sources, request)
@@ -210,11 +278,12 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
                     by_id[candidate.id] = existing.model_copy(deep=True) if existing and ImageDownloader.reusable(existing) else candidate
             candidates = list(by_id.values())
         for candidate in candidates:
-            candidate.signals["supplement_source_url"] = source_url
-            candidate.signals["supplement_attempt_id"] = attempt_id
-            candidate.selected = False
+            candidate.signals[provenance_key] = source_url
+            candidate.signals[f"{kind}_attempt_id"] = attempt_id
+            if kind == "supplement":
+                candidate.selected = False
         save()  # All candidates exist on disk before the first media request.
-        emit("正在下载补充图片…")
+        emit("正在下载补充图片…" if kind == "supplement" else "正在重试图片采集…")
         pending = [c for c in candidates if not ImageDownloader.reusable(c) and c.download_status != "permanent_failed"]
         async def on_result(candidate, failure):
             if failure:
@@ -226,6 +295,10 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
         token.raise_if_cancelled()
         status = "completed"
     except (CancellationRequested, asyncio.CancelledError):
+        # A pre-cancelled task can stop before an attempt directory is made.
+        # Still produce a valid empty cancelled manifest during finalization.
+        if not attempt_root.is_dir():
+            attempt_root.mkdir(parents=True, exist_ok=False)
         status = "cancelled"
     except Exception as exc:
         if not attempt_root.is_dir():
@@ -241,13 +314,14 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
                 def prepare():
                     nonlocal candidates
                     issue = Issue(issue_id=issue_id, input_path=str(request.input_path), news_items=[news])
-                    curated = ImageCurator(config).curate(issue, candidates)
+                    curated = ImageCurator(config).curate(issue, candidates, runner.history if kind == "retry" else None)
                     failures.extend(curated.failures)
                     candidates = [*curated.candidates, *curated.filtered_candidates]
                     for candidate in candidates:
-                        candidate.selected = False
-                        if candidate.curation_status is not ImageCurationStatus.INVALID:
-                            candidate.curation_status = ImageCurationStatus.UNSELECTED
+                        if kind == "supplement":
+                            candidate.selected = False
+                            if candidate.curation_status is not ImageCurationStatus.INVALID:
+                                candidate.curation_status = ImageCurationStatus.UNSELECTED
                         source = OutputManager._image_source(candidate)
                         if source and ImageDownloader.reusable(candidate) and not candidate.signals.get("invalid_file"):
                             try:
@@ -275,9 +349,11 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
                     status = "partial"
                 save()
         finally:
-            runner.network_metrics = runtime.stats()
             try:
-                await runtime.close()
+                try:
+                    runner.network_metrics = runtime.stats()
+                finally:
+                    await runtime.close()
             finally:
                 runner._network_runtime = None
                 runner._download_journal = old_journal

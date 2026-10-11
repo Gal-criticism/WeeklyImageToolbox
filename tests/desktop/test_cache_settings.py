@@ -32,11 +32,9 @@ def test_settings_page_persists_theme_and_credential(tmp_path: Path):
     credentials = CredentialStore(InMemoryCredentialBackend())
     page = SettingsPage(settings_store=store, credential_store=credentials)
     page.theme_combo.setCurrentIndex(page.theme_combo.findData("dark"))
-    page.brave_edit.setText("secret")
     page.socialdata_edit.setText("socialdata-secret")
     page.save()
     assert store.load().theme == "dark"
-    assert credentials.get("brave_api_key") == "secret"
     assert credentials.get("socialdata_api_key") == "socialdata-secret"
     page.close()
     app.processEvents()

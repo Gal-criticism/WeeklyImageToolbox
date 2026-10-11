@@ -23,8 +23,8 @@ def test_pyinstaller_spec_is_syntax_valid_and_targets_portable_executable():
     tree = ast.parse(spec.read_text(encoding="utf-8"), filename=str(spec))
     assert tree
     source = spec.read_text(encoding="utf-8")
-    assert "GalgameNewsToolbox" in source
-    assert "GalgameNewsToolbox.exe" in source
+    assert "WeeklyImageToolbox" in source
+    assert "WeeklyImageToolbox.exe" in source
     assert "bin" in source
     assert "config" in source
     assert '"desktop_entry.py"' in source

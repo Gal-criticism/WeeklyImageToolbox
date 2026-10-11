@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/toolbox-mark.svg" width="112" height="112" alt="周报图片采集工具箱标识">
+  <img src="src/galgame_news/desktop/assets/character.png" width="112" height="112" alt="周报图片采集工具箱角色图">
 </p>
 
 <h1 align="center">周报图片采集工具箱</h1>
@@ -7,9 +7,15 @@
 <p align="center">从一份 DOCX 开始，采集新闻配图、检查来源，再由你决定最终选图。</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-%E2%89%A53.11-3776AB?logo=python&logoColor=white" alt="Python ≥3.11">
-  <img src="https://img.shields.io/badge/PySide6-GUI-7862AF" alt="PySide6 桌面界面">
-  <img src="https://img.shields.io/badge/Windows-Desktop-0078D6" alt="Windows 桌面工具">
+  <a href="https://github.com/kasumi-ppp/galgame-news/releases/download/v1.0.0/WeeklyImageToolbox-v1.0.0-windows-x64.zip"><strong>下载 Windows x64 便携版 v1.0.0</strong></a>
+  · <a href="https://github.com/kasumi-ppp/galgame-news/releases/latest">查看最新版</a>
+</p>
+
+解压后运行 `WeeklyImageToolbox.exe`。这是完整便携版，无需安装 Python。
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Windows-x64%20Portable-0078D6" alt="Windows x64 便携版">
+  <img src="https://img.shields.io/badge/Python-Not%20required-3776AB?logo=python&logoColor=white" alt="便携版无需 Python">
 </p>
 
 <p align="center">
@@ -22,7 +28,7 @@
 
 适合需要整理新作、汉化和周报配图的编辑及测试用户。工具箱负责收集和整理候选，你可以逐条新闻检查已选图片与“未候选”备选，并导出确认后的结果。
 
-> 仓库名与程序界面仍沿用 `galgame-news` / “Galgame 新闻工具箱”。本文中的“周报图片采集工具箱”是项目对外介绍名称。以下截图来自离线演示数据，不代表真实抓取成果或筛选准确率。
+> 以下截图来自离线演示数据，不代表真实抓取成果或筛选准确率。
 
 ## 界面预览
 
@@ -47,7 +53,7 @@
 
 | 功能 | 可以做什么 |
 | --- | --- |
-| 新闻栏目选择 | 新作、汉化、周报独立勾选，保留原文档顺序与 `xN` / `hN` / `zN` 编号 |
+| 新闻栏目选择 | 新作、汉化、周边独立勾选，保留原文档顺序与 `xN` / `hN` / `zN` 编号 |
 | 官网图片采集 | 发现相关作品页、图库与商品详情；动态图库可启用浏览器补充采集 |
 | 可选 X API | 配置自己的 SocialData 凭据后，按帖子提取媒体；每次任务默认关闭 |
 | 汉化配图 | 识别 VNDB 发行记录对应作品及 Steam 本作品截图，优先获取高清原图 |
@@ -57,7 +63,7 @@
 | 任务恢复 | 暂停、继续、停止，历史任务重新审核及可恢复媒体续跑 |
 | 中文桌面界面 | 浅色、深色和跟随系统；中文进度摘要与可展开的技术详情 |
 
-X API 照片保留最高来源优先级，仍遵循新闻内去重和数量限制。其他来源的高清图片也需要作品关联和图片证据，不能仅凭来自 VNDB、Steam 或官网就自动入选。
+X API 照片保留最高来源优先级，仍遵循新闻内去重和数量限制。SocialData 默认关闭，使用时需自行配置密钥并逐任务启用；发行包不含私测凭据。其他来源的高清图片也需要作品关联和图片证据，不能仅凭来自 VNDB、Steam 或官网就自动入选。
 
 ### 一次任务的流程
 
@@ -71,34 +77,9 @@ flowchart LR
 
 ## 快速开始
 
-目前没有公开发布包，推荐从源码运行。已有私测包不属于公开下载入口。
+下载 Windows x64 完整便携版：[WeeklyImageToolbox-v1.0.0-windows-x64.zip](https://github.com/kasumi-ppp/galgame-news/releases/download/v1.0.0/WeeklyImageToolbox-v1.0.0-windows-x64.zip)，或前往[最新版发布页](https://github.com/kasumi-ppp/galgame-news/releases/latest)。v1.0.0 [发布说明](https://github.com/kasumi-ppp/galgame-news/releases/tag/v1.0.0)。解压后运行 `WeeklyImageToolbox.exe`；完整包无需安装 Python。
 
-在 Windows 上安装 **Python 3.11 或更新版本**，打开 PowerShell：
-
-```powershell
-git clone https://github.com/kasumi-ppp/galgame-news.git
-cd galgame-news
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[desktop]"
-.\.venv\Scripts\python.exe -c "from galgame_news.desktop.app import main; raise SystemExit(main())"
-```
-
-启动后选择 DOCX、期号和输出目录，勾选至少一个栏目，再点击“开始抓取”。建议首次使用保持“跳过视频，仅抓取图片”，SocialData 留为关闭。
-
-需要动态图库浏览器组件时，安装可选依赖：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[desktop,browser]"
-.\.venv\Scripts\python.exe -m playwright install chromium
-```
-
-也可以使用命令行处理一份周报，**显式指定输出目录**：
-
-```powershell
-.\.venv\Scripts\python.exe -m galgame_news run "input/demo.docx" --issue demo --output "output/demo" --no-videos
-```
-
-`demo.docx` 是路径示例，请换成自己的文档。栏目复选框和每次任务的 SocialData 开关位于桌面界面，CLI 没有对应开关。[完整安装与启动说明](docs/user/quick-start.md)
+首次使用建议保持“跳过视频”选中，并让 SocialData 保持关闭。SocialData 需要自备密钥、逐任务启用，发行包不含任何私测凭据。需要脚本处理的用户可参考[手册中的 CLI 入口](docs/user/manual.md#命令行)。
 
 ## 图片与任务输出
 

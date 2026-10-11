@@ -16,6 +16,8 @@ def create_application(argv: Sequence[str] | None = None) -> tuple[QApplication,
     app = QApplication.instance()
     if app is None:
         app = QApplication(list(argv) if argv is not None else sys.argv)
+    app.setApplicationDisplayName("周报图片采集工具箱")
+    app.setApplicationVersion("1.0.0")
     controller = DesktopController()
     window = MainWindow(controller)
     try:

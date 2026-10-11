@@ -70,12 +70,14 @@ def test_original_fallback_has_one_attempt_and_keeps_raw_link(tmp_path):
 def test_resume_reuses_verified_source_and_clears_download_failure(tmp_path):
     value = candidate("photo")
     downloader = ImageDownloader(load_config(), transport=lambda url, **kwargs: response(url))
+    downloader.client.resolver = lambda _: ["93.184.216.34"]
     downloader.download([value], tmp_path)
     value.signals["invalid_reason"] = "download_error"
     value.download_status = "retryable_failed"
     def unexpected(*args, **kwargs):
         raise AssertionError("must reuse the verified original")
     resumed = ImageDownloader(load_config(), transport=unexpected)
+    resumed.client.resolver = lambda _: ["93.184.216.34"]
     values, failures = resumed.download([value], tmp_path)
     assert not failures and values[0].download_status == "downloaded"
     assert "invalid_reason" not in value.signals
@@ -89,7 +91,9 @@ def test_old_x_url_upgrades_for_request_without_changing_id(tmp_path):
     def transport(url,**kwargs):
         urls.append(url)
         return response(url)
-    ImageDownloader(load_config(),transport=transport).download([value],tmp_path)
+    downloader = ImageDownloader(load_config(), transport=transport)
+    downloader.client.resolver = lambda _: ["93.184.216.34"]
+    downloader.download([value], tmp_path)
     assert value.id==before
     assert urls==["https://pbs.twimg.com/media/photo.jpg?name=orig"]
     assert value.downloaded_url==urls[0]

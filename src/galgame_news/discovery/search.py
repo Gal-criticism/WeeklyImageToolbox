@@ -118,11 +118,13 @@ class BraveSearchProvider:
 class FallbackSearchProvider:
     def __init__(self, brave: BraveSearchProvider | None = None, ddgs: DDGSSearchProvider | None = None, *, max_results: int = 5, timeout: float = 5.0):
         self.max_results = max_results
-        self.brave = brave or BraveSearchProvider(max_results=max_results)
+        # Brave remains injectable for explicit compatibility, while the
+        # default discovery path uses public DDGS only.
+        self.brave = brave
         self.ddgs = ddgs or DDGSSearchProvider(max_results=max_results, timeout=timeout)
 
     def search(self, news_item: NewsItem) -> list[SourceRef]:
-        brave_results = self.brave.search(news_item)
+        brave_results = self.brave.search(news_item) if self.brave is not None else []
         queries = _search_queries(news_item)
         if len(queries) > 1:
             # CG-specific recall is important enough to query both existing

@@ -28,26 +28,37 @@ def system_theme(app: QApplication | None = None) -> str:
     return "light"
 
 
+COLORS = {
+    "light": dict(window="#FFF7F3", card="#FFFDFC", accent="#B7544E", selection="#F6E1DA",
+                  text="#303747", border="#E4CCC3", muted="#77737F", hover="#9C443F",
+                  disabled="#91868B", accent_text="#FFFFFF", secondary="#788B9E",
+                  error="#A72D2D", warning="#8B631B"),
+    "dark": dict(window="#242832", card="#303541", accent="#D98270", selection="#49404A",
+                 text="#F5EFEA", border="#60616B", muted="#B8B0AC", hover="#E69A89",
+                 disabled="#A09AA3", accent_text="#242832", secondary="#94A7BD",
+                 error="#FF9B96", warning="#EBC582"),
+}
+
+
+def theme_colors() -> dict[str, str]:
+    app = QApplication.instance()
+    return COLORS["dark" if app and app.palette().color(QPalette.ColorRole.Window).lightness() < 128 else "light"]
+
+
 def _palette(dark: bool) -> QPalette:
     palette = QPalette()
+    c = COLORS["dark" if dark else "light"]
     colors = {
-        "Window": "#242231" if dark else "#f5f3fb",
-        "WindowText": "#f0edf8" if dark else "#302c46",
-        "Base": "#302d40" if dark else "#ffffff",
-        "AlternateBase": "#383448" if dark else "#efecf9",
-        "Text": "#f0edf8" if dark else "#302c46",
-        "Button": "#383448" if dark else "#ffffff",
-        "ButtonText": "#f0edf8" if dark else "#302c46",
-        "Highlight": "#7860b5", "HighlightedText": "#ffffff",
-        "Mid": "#504a65" if dark else "#ded9ee",
-        "PlaceholderText": "#aaa2bd" if dark else "#827a98",
-        "ToolTipBase": "#302d40" if dark else "#ffffff",
-        "ToolTipText": "#f0edf8" if dark else "#302c46",
+        "Window": c["window"], "WindowText": c["text"], "Base": c["card"],
+        "AlternateBase": c["selection"], "Text": c["text"], "Button": c["card"],
+        "ButtonText": c["text"], "Highlight": c["accent"], "HighlightedText": c["accent_text"],
+        "Mid": c["border"], "PlaceholderText": c["muted"],
+        "ToolTipBase": c["card"], "ToolTipText": c["text"], "Link": c["accent"],
     }
     for role, color in colors.items():
         palette.setColor(getattr(QPalette.ColorRole, role), QColor(color))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#8c8799"))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#8c8799"))
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(c["disabled"]))
     return palette
 
 
@@ -62,33 +73,44 @@ QFrame#sidebar, QGroupBox, QFrame#card { background: palette(base); border: 1px 
 QGroupBox { margin-top: 16px; padding: 22px 16px 14px; font-weight: 600; }
 QGroupBox::title { subcontrol-origin: margin; left: 18px; padding: 2px 8px; }
 QLineEdit, QComboBox, QPlainTextEdit { background: palette(base); border: 1px solid palette(mid); border-radius: 8px; padding: 8px; selection-background-color: palette(highlight); }
-QLineEdit:focus, QComboBox:focus { border: 1px solid #9680d5; }
+QLineEdit:focus, QComboBox:focus { border: 1px solid @accent; }
 QPushButton { background: palette(button); border: 1px solid palette(mid); border-radius: 8px; padding: 9px 15px; }
-QPushButton:hover { border-color: #9680d5; background: palette(alternate-base); }
+QPushButton:hover { border-color: @accent; background: palette(alternate-base); }
 QPushButton:pressed { background: palette(mid); }
-QPushButton[primary="true"] { background: #7860b5; color: white; border: 1px solid #7860b5; font-weight: 600; }
-QPushButton[primary="true"]:hover { background: #8b72c5; }
-QPushButton:disabled { color: #938caa; background: palette(alternate-base); }
+QPushButton[primary="true"] { background: @accent; color: @accent_text; border: 1px solid @accent; font-weight: 600; }
+QPushButton[primary="true"]:hover { background: @hover; }
+QPushButton:disabled, QPushButton[primary="true"]:disabled { color: @disabled; background: palette(alternate-base); border-color: palette(mid); }
 QCheckBox { spacing: 9px; padding: 7px 0; }
 QCheckBox::indicator { width: 17px; height: 17px; border: 1px solid palette(mid); border-radius: 4px; background: palette(base); }
-QCheckBox::indicator:checked { background: #9680d5; border: 3px solid #cbbbed; }
+QCheckBox::indicator:checked { background: @accent; border: 3px solid @selection; }
+QCheckBox::indicator:disabled { background: palette(alternate-base); border-color: @disabled; }
 QListWidget, QTreeWidget { background: palette(base); border: 1px solid palette(mid); border-radius: 12px; padding: 6px; outline: none; }
 QListWidget::item, QTreeWidget::item { padding: 10px; border-radius: 8px; }
-QListWidget::item:selected, QTreeWidget::item:selected { background: palette(alternate-base); color: palette(text); border: 1px solid #b5a4df; }
+QListWidget::item:selected, QTreeWidget::item:selected { background: palette(alternate-base); color: palette(text); border: 1px solid @accent; }
 QListWidget#navigation { background: transparent; border: none; padding: 0; }
 QListWidget#navigation::item { padding: 15px 10px; margin: 4px 0; }
 QTabWidget::pane { border: none; }
 QTabBar::tab { background: palette(base); padding: 10px 15px; border: 1px solid palette(mid); }
-QTabBar::tab:selected { color: #9680d5; border-bottom: 3px solid #9680d5; }
+QTabBar::tab:selected { color: @accent; border-bottom: 3px solid @accent; }
 QProgressBar { background: palette(base); border: 1px solid palette(mid); border-radius: 7px; text-align: center; min-height: 23px; }
-QProgressBar::chunk { background: #a58cd7; border-radius: 6px; }
+QProgressBar::chunk { background: @accent; border-radius: 6px; }
 QSplitter::handle { background: palette(window); width: 7px; height: 7px; }
 QScrollArea { border: none; background: transparent; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: palette(mid); border-radius: 5px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QToolTip { padding: 7px; border: 1px solid palette(mid); }
+QLabel[severity="error"] { color: @error; }
+QLabel[severity="warning"] { color: @warning; }
 """
+
+
+def stylesheet(dark: bool) -> str:
+    result = STYLE
+    # Replace longer names first (accent_text before accent).
+    for name, color in sorted(COLORS["dark" if dark else "light"].items(), key=lambda item: -len(item[0])):
+        result = result.replace("@" + name, color)
+    return result
 
 
 def _prepare_font(app: QApplication) -> None:
@@ -128,7 +150,7 @@ def apply_theme(theme: str = "system", app: QApplication | None = None) -> str:
             app.setStyle("Fusion")
         _prepare_font(app)
         app.setPalette(_palette(effective == "dark"))
-        app.setStyleSheet(STYLE)
+        app.setStyleSheet(stylesheet(effective == "dark"))
     return effective
 
 

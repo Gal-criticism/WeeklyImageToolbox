@@ -37,16 +37,34 @@ def _output(tmp_path: Path) -> tuple[Path, ReviewSession]:
     return output, session
 
 
+def wait_ready(qtbot, page: ReviewPage) -> None:
+    qtbot.waitUntil(lambda: (
+        not page.query.busy
+        and page._render_cursor >= len(page._render_source)
+        and page.query.pool.activeThreadCount() == 0
+        and page.state_writer.pool.activeThreadCount() == 0
+        and not page.query._retired
+        and not page.state_writer._retired
+        and (page._query_identity is None or (
+            page.session is not None
+            and page._query_identity[0] == id(page.session)
+            and page._query_identity[1] == page.session.revision
+        ))
+    ), timeout=10000)
+
+
 def test_review_page_persists_decision_and_exposes_source(qtbot, tmp_path: Path):
     output, session = _output(tmp_path)
     page = ReviewPage()
     qtbot.addWidget(page)
     page.set_session(session)
+    wait_ready(qtbot, page)
     assert page.media_list.count() == 1
     page.media_list.setCurrentRow(0)
     page.accept_selected()
     assert session.decision("image-1") is ReviewDecision.ACCEPTED
     page.tabs.setCurrentIndex(0)
+    wait_ready(qtbot, page)
     page.media_list.setCurrentRow(0)
     assert page.source_button.isEnabled()
     assert page.retry_button.isEnabled()
@@ -82,6 +100,7 @@ def test_review_page_keeps_failed_candidates_in_session_order(qtbot, tmp_path: P
     page = ReviewPage()
     qtbot.addWidget(page)
     page.set_session(session)
+    wait_ready(qtbot, page)
     assert [str(item.id) for item in page.failed_candidates()] == ["image-a", "image-b"]
 
 
@@ -115,6 +134,8 @@ def test_review_page_retry_exposes_optional_official_url(qtbot, tmp_path: Path):
     page = ReviewPage()
     qtbot.addWidget(page)
     page.set_session(session)
+    wait_ready(qtbot, page)
+    page.media_list.setCurrentRow(0)
     page.retry_url_edit.setText("https://official.example/retry")
     category = page.news_list.topLevelItem(0).child(2)  # The fixture belongs to 周边.
     page.news_list.setCurrentItem(category.child(0))

@@ -15,7 +15,7 @@ from typing import Any, Callable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SPEC_PATH = PROJECT_ROOT / "packaging" / "GalgameNewsToolbox.spec"
 DIST_ROOT = PROJECT_ROOT / "dist"
-BUNDLE_NAME = "GalgameNewsToolbox"
+BUNDLE_NAME = "WeeklyImageToolbox"
 TARGET_EXECUTABLE = BUNDLE_NAME + ".exe"
 SHORTCUT_NAME = "00_启动工具箱.lnk"
 

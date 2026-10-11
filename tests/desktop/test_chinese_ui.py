@@ -61,12 +61,11 @@ def test_theme_codes_and_saved_keys_stay_masked(qtbot, tmp_path):
     assert page.credential_status["socialdata_api_key"].text() == "已配置"
     page.theme_combo.setCurrentIndex(page.theme_combo.findData("dark"))
     page.theme_combo.setItemText(page.theme_combo.currentIndex(), "任意中文标题")
-    page.brave_edit.setText("new-private-value")
+    page.socialdata_edit.setText("new-private-value")
     page.save()
     assert store.load().theme == "dark"
-    assert credentials.get("socialdata_api_key") == "existing-private-value"
-    assert credentials.get("brave_api_key") == "new-private-value"
-    assert page.brave_edit.text() == ""
+    assert credentials.get("socialdata_api_key") == "new-private-value"
+    assert page.socialdata_edit.text() == ""
     assert "private-value" not in store.path.read_text(encoding="utf-8")
 
 
@@ -198,7 +197,7 @@ def test_ui_retry_factory_error_emits_existing_failure_and_raw_detail(qtbot, tmp
     qtbot.addWidget(controller.review_page)
     output = tmp_path / "output"
     output.mkdir()
-    (output / "image_index.json").write_text('{"candidates": []}', encoding="utf-8")
+    (output / "image_index.json").write_text('{"candidates": [], "news_items": [{"news_id": "news-1", "title": "新闻一", "section": "新作"}]}', encoding="utf-8")
     controller.review_record = controller.task_store.create_task("226", tmp_path / "226.docx")
     controller.review_page.set_session(ReviewSession.from_output(output))
     controller.review_page.retry_url_edit.setText("https://official.test/news")

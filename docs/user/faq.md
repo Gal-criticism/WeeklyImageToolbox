@@ -1,8 +1,8 @@
 # 常见问题
 
-## 界面为什么叫 Galgame新闻工具箱？
+## 便携版在哪里下载？需要安装 Python 吗？
 
-“周报图片采集工具箱”是对外名称；当前程序窗口名称仍是“Galgame新闻工具箱”。这是同一个项目。
+从[GitHub Releases 最新版本](https://github.com/kasumi-ppp/galgame-news/releases/latest)下载 `WeeklyImageToolbox-v1.0.0-windows-x64.zip`，解压并运行 `WeeklyImageToolbox.exe`。这是完整 Windows x64 便携版，无需 Python。v1.0.0 发布页：[查看发布说明](https://github.com/kasumi-ppp/galgame-news/releases/tag/v1.0.0)。
 
 ## X 帖子有记录，但没有图片怎么办？
 
@@ -45,4 +45,4 @@ python -m playwright install chromium
 
 ## 命令行能选择栏目或启用 SocialData 吗？
 
-当前 CLI 不提供这两个专用参数。使用桌面界面，在新建任务页选择 `x`（新作）、`h`（汉化）、`z`（周报）栏目，或按需启用 SocialData。
+当前 CLI 不提供这两个专用参数。使用桌面界面，在新建任务页选择 `x`（新作）、`h`（汉化）、`z`（周边）栏目，或按需启用 SocialData。

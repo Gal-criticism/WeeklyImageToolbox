@@ -436,6 +436,7 @@ def test_single_news_retry_appends_candidates_without_overwriting_raw(
         assert controller.retry_news(
             "news-1", "https://official.example/retry"
         )
+        qtbot.waitUntil(lambda: not controller.is_supplement_running, timeout=10000)
         session = controller.review_page.session
         assert session is not None
         assert [str(item.id) for item in session.images] == [
@@ -657,8 +658,7 @@ def test_duplicate_videos_and_failures_are_merged_in_desktop_run(qtbot, tmp_path
 
 
 def test_desktop_settings_keep_credentials_out_of_app_data(qtbot, tmp_path: Path):
-    brave = "brave-secret-task5"
-    x_token = "x-secret-task5"
+    socialdata = "socialdata-secret-task5"
     backend = InMemoryCredentialBackend()
     controller = DesktopController(
         app_data=tmp_path / "app",
@@ -666,8 +666,7 @@ def test_desktop_settings_keep_credentials_out_of_app_data(qtbot, tmp_path: Path
     )
     qtbot.addWidget(controller.settings_page)
     try:
-        controller.settings_page.brave_edit.setText(brave)
-        controller.settings_page.x_edit.setText(x_token)
+        controller.settings_page.socialdata_edit.setText(socialdata)
         controller.settings_page.save()
         persisted = [
             path.read_bytes()
@@ -675,10 +674,8 @@ def test_desktop_settings_keep_credentials_out_of_app_data(qtbot, tmp_path: Path
             if path.is_file()
         ]
         assert persisted
-        assert all(brave.encode() not in payload for payload in persisted)
-        assert all(x_token.encode() not in payload for payload in persisted)
-        assert brave not in repr(controller.credential_store)
-        assert x_token not in repr(controller.credential_store)
+        assert all(socialdata.encode() not in payload for payload in persisted)
+        assert socialdata not in repr(controller.credential_store)
     finally:
         controller.close()
         controller.task_store.close()

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import Any
+from types import SimpleNamespace
+import inspect
 
 from PySide6.QtCore import QObject, Signal, Slot
 
@@ -95,4 +97,39 @@ class SupplementWorker(QObject):
         else:
             self.finished.emit(value)
 
-__all__ = ["PipelineWorker", "TaskWorker"]
+
+class ReviewGrabWorker(QObject):
+    """Collect and prepare assets off-thread, returning a delta, never a session."""
+
+    event = Signal(object)
+    finished = Signal(object)
+    failed = Signal(object)
+
+    def __init__(self, runner, kind, kwargs, token, snapshot, identity):
+        super().__init__()
+        self.runner, self.kind, self.kwargs, self.token = runner, kind, kwargs, token
+        self.snapshot, self.identity = snapshot, identity
+
+    @Slot()
+    def run(self):
+        try:
+            method = getattr(self.runner, "supplement_news" if self.kind == "supplement" else "retry_news")
+            kwargs = dict(self.kwargs, event_sink=self.event.emit, cancellation_token=self.token)
+            # Keep existing synchronous injected runners usable in this worker.
+            signature = inspect.signature(method)
+            if not any(p.kind is p.VAR_KEYWORD for p in signature.parameters.values()):
+                kwargs = {k: v for k, v in kwargs.items() if k in signature.parameters}
+            result = method(**kwargs)
+            attempt_id = getattr(result, "attempt_id", None)
+            if isinstance(result, dict):
+                attempt_id = result.get("attempt_id") or result.get("id")
+            if attempt_id is None:
+                from pathlib import Path
+                attempt_id = Path(str(result)).name
+            self.event.emit(SimpleNamespace(message="正在校验图片与准备合并…"))
+            delta = self.snapshot.prepare_retry_delta(self.kwargs["news_id"], str(attempt_id))
+            self.finished.emit((self.identity, result, delta))
+        except BaseException as exc:
+            self.failed.emit((self.identity, exc))
+
+__all__ = ["PipelineWorker", "TaskWorker", "SupplementWorker", "ReviewGrabWorker"]
