@@ -1,15 +1,16 @@
 # 周报图片采集工具箱：Windows x64 便携版构建
 
 正式发布包由 `packaging/release.py` 从全新临时构建目录生成，完整包含 Windows x64 PyInstaller onedir 运行时与浏览器组件。发布压缩包为
-`WeeklyImageToolbox-v1.0.0-windows-x64.zip`，解压后的可执行文件为
+`WeeklyImageToolbox-v1.1.0-windows-x64.zip`，解压后的可执行文件为
 `WeeklyImageToolbox.exe`。用户无需安装 Python。发布页为
-https://github.com/kasumi-ppp/galgame-news/releases/tag/v1.0.0，最新版本入口为
-https://github.com/kasumi-ppp/galgame-news/releases/latest。
+https://github.com/Gal-criticism/WeeklyImageToolbox/releases/tag/v1.1.0，最新版本入口为
+https://github.com/Gal-criticism/WeeklyImageToolbox/releases/latest。
 
 从干净的源码检出安装固定版本构建依赖，并运行正式发布脚本：
 
 ```powershell
-python -m pip install -e ".[desktop,dev,build]"
+python -m pip install -r packaging/requirements-release.lock
+python -m pip install --no-deps -e .
 python packaging/release.py
 ```
 

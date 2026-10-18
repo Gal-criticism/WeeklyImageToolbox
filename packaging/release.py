@@ -1,4 +1,4 @@
-"""Create and verify the official Windows x64 v1.0.0 release ZIP."""
+"""Create and verify the official Windows x64 v1.1.0 release ZIP."""
 from __future__ import annotations
 
 import argparse
@@ -16,7 +16,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BUNDLE = "WeeklyImageToolbox"
 ARCHIVE = f"{BUNDLE}-v{VERSION}-windows-x64.zip"
 FFMPEG_VERSION = "8.1.2"
@@ -40,7 +40,7 @@ def sha256(path: Path) -> str:
 
 def _download_ffmpeg(destination: Path) -> Path:
     archive = destination / "ffmpeg.zip"
-    request = urllib.request.Request(FFMPEG_URL, headers={"User-Agent": "WeeklyImageToolbox-release/1.0.0"})
+    request = urllib.request.Request(FFMPEG_URL, headers={"User-Agent": "WeeklyImageToolbox-release/1.1.0"})
     with urllib.request.urlopen(request, timeout=120) as response, archive.open("wb") as output:
         shutil.copyfileobj(response, output)
     actual = sha256(archive)
@@ -76,7 +76,7 @@ def _collect_files(bundle: Path, output: Path) -> list[Path]:
     shutil.copytree(bundle / "bin", release / "bin")
     shutil.copy2(ROOT / "packaging" / "THIRD_PARTY_NOTICES.md", release / "THIRD_PARTY_NOTICES.md")
     (release / "README.txt").write_text(
-        "Weekly Image Toolbox v1.0.0 (Windows x64)\n\n"
+        "Weekly Image Toolbox v1.1.0 (Windows x64)\n\n"
         "Extract the complete folder, then run WeeklyImageToolbox.exe. Keep the browser, bin, and _internal folders beside the executable.\n"
         "The package includes Playwright Chromium and FFmpeg/ffprobe for offline browser and video support.\n"
         "See THIRD_PARTY_NOTICES.md and licenses/ for third-party licenses and notices.\n"

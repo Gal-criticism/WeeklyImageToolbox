@@ -135,6 +135,8 @@ timer = QTimer()
 def trigger():
     if (root / "exit").exists():
         timer.stop()
+        # Measure the confirmed exit handler, not first-paint/startup latency.
+        (root / "exit-started").write_text(str(time.monotonic()), encoding="ascii")
         window.close()
 timer.timeout.connect(trigger)
 timer.start(10)
@@ -172,9 +174,14 @@ def test_real_desktop_forces_exit_with_locked_database_and_owned_children(tmp_pa
             handle = api.kernel.OpenProcess(0x100001, False, pid)  # SYNCHRONIZE | TERMINATE
             assert handle
             handles.append(handle)
-        started = time.monotonic()
         (tmp_path / "exit").touch()
-        proc.wait(timeout=1)
+        acknowledged = tmp_path / "exit-started"
+        delivery_deadline = time.monotonic() + 5
+        while not acknowledged.exists() and proc.poll() is None and time.monotonic() < delivery_deadline:
+            time.sleep(0.005)
+        assert acknowledged.exists(), "desktop did not dispatch the exit request"
+        started = float(acknowledged.read_text(encoding="ascii"))
+        proc.wait(timeout=max(0.001, 1 - (time.monotonic() - started)))
         for handle in handles:
             assert wait(handle, max(0, int((1 - (time.monotonic() - started)) * 1000))) == 0
         elapsed = time.monotonic() - started
@@ -197,3 +204,17 @@ def test_real_desktop_forces_exit_with_locked_database_and_owned_children(tmp_pa
         proc.communicate(timeout=5)
         unrelated.kill()
         unrelated.wait(timeout=5)
+
+
+def test_default_windows_exit_bypasses_runtime_finalizers(monkeypatch):
+    class Windows(_FakeWindows):
+        def terminate_self(self, code):
+            self.calls.append(("self", code))
+            return True
+    api = Windows(init_fails=True)
+    def forbidden(code):
+        raise AssertionError("CRT exit must not run after native termination")
+    monkeypatch.setattr(os, "_exit", forbidden)
+    owner = DesktopProcessExit(windows_api=api)
+    owner.force_exit(4)
+    assert api.calls[-1] == ("self", 4)

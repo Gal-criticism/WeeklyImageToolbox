@@ -82,6 +82,11 @@ class _WindowsProcesses:
     def terminate_job(self, job, code):
         return bool(self.kernel.TerminateJobObject(job, code))
 
+    def terminate_self(self, code):
+        # TerminateProcess bypasses DLL detach. CRT _exit/ExitProcess can
+        # deadlock on a lock held by one of the deliberately abandoned workers.
+        return bool(self.kernel.TerminateProcess(self.kernel.GetCurrentProcess(), code))
+
     def _created(self, handle):
         values = [wintypes.FILETIME() for _ in range(4)]
         if not self.kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in values)):
@@ -153,6 +158,7 @@ class DesktopProcessExit:
 
     def __init__(self, *, exit_function=None, windows_api=None):
         self._exit = exit_function or os._exit
+        self._native_exit = exit_function is None
         self._windows = None
         self._job = None
         self._exiting = False
@@ -177,6 +183,12 @@ class DesktopProcessExit:
                     pass
                 self._windows.terminate_descendants(os.getpid(), code)
         finally:
+            if self._native_exit and self._windows is not None:
+                try:
+                    if self._windows.terminate_self(code):
+                        return
+                except Exception:
+                    pass
             self._exit(code)
 
 

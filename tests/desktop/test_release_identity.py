@@ -9,7 +9,7 @@ def test_public_name_and_legacy_storage(qtbot, monkeypatch, tmp_path):
     qtbot.addWidget(window)
     assert window.windowTitle() == "周报图片采集工具箱"
     assert app.applicationDisplayName() == "周报图片采集工具箱"
-    assert app.applicationVersion() == "1.0.0"
+    assert app.applicationVersion() == "1.1.0"
     assert APP_DATA_NAME == "GalgameNewsToolbox"
     window.controller.close(timeout_ms=5000)
 

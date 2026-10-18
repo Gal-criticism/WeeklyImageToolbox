@@ -22,8 +22,8 @@ def _release_module():
 
 def test_release_metadata_is_explicit_and_dependency_versions_are_locked():
     release = _release_module()
-    assert release.VERSION == "1.0.0"
-    assert release.ARCHIVE == "WeeklyImageToolbox-v1.0.0-windows-x64.zip"
+    assert release.VERSION == "1.1.0"
+    assert release.ARCHIVE == "WeeklyImageToolbox-v1.1.0-windows-x64.zip"
     assert len(release.FFMPEG_SHA256) == 64
     requirements = (ROOT / "packaging" / "requirements-release.lock").read_text(encoding="utf-8")
     for package in ("PyInstaller", "PySide6", "playwright", "pytest", "httpx", "pydantic"):

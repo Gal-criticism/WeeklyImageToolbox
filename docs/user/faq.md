@@ -2,11 +2,11 @@
 
 ## 便携版在哪里下载？需要安装 Python 吗？
 
-从[GitHub Releases 最新版本](https://github.com/kasumi-ppp/galgame-news/releases/latest)下载 `WeeklyImageToolbox-v1.0.0-windows-x64.zip`，解压并运行 `WeeklyImageToolbox.exe`。这是完整 Windows x64 便携版，无需 Python。v1.0.0 发布页：[查看发布说明](https://github.com/kasumi-ppp/galgame-news/releases/tag/v1.0.0)。
+Windows x64 v1.1.0 便携版从[GitHub Releases 最新版本](https://github.com/Gal-criticism/WeeklyImageToolbox/releases/latest)下载；[v1.1.0 发布说明](https://github.com/Gal-criticism/WeeklyImageToolbox/releases/tag/v1.1.0)。解压运行 `WeeklyImageToolbox.exe`，无需安装 Python。
 
 ## X 帖子有记录，但没有图片怎么办？
 
-先在图片审核页检查对应新闻的“未候选／待复核”和“已排除”页签，查看失败状态、来源和原图按钮。X 来源的图片可能无法公开访问、已经失效，或需要你自行配置的 API 凭据。可在设置页填写自己的凭据；SocialData 需要在该轮新建任务时显式勾选，默认关闭。已记录的失败媒体可通过历史任务继续恢复；媒体恢复利用已有记录，不应重新付费查询帖子。官网采集问题才使用“重试本条新闻”并填写官网地址，这不是专门的 X 恢复入口。外部来源失效时无法保证补回图片。
+先在图片审核页检查对应新闻的“未候选／待复核”和“已排除”页签，查看失败状态、来源和原图按钮。X 来源的图片可能无法公开访问、已经失效，或需要你自行配置的 API 凭据。可在设置页填写自己的凭据；SocialData 需要在该轮新建任务时显式勾选，默认关闭。已记录的失败 X/YouTube 媒体可通过历史任务恢复，恢复使用已有记录，不会自动重新查询 SocialData。官网采集问题可使用“重试本条新闻”并填写官网地址。外部来源失效时无法保证补回图片。
 
 ## 提示缺少浏览器或 Playwright 怎么办？
 
@@ -42,6 +42,14 @@ python -m playwright install chromium
 ## 最终图片目录里为什么可能有视频？
 
 视频单独显示在“视频”页签，已选视频会随最终媒体导出到 `final/images` 的对应新闻目录，不会被转换成图片。只需要图片时，保持“跳过视频”选中；如需采集视频则取消勾选，并在播放或处理视频时检查 FFmpeg 是否可用。
+
+## 可以只导出已选图片吗？
+
+可以。在审核页取消“同时导出未候选图片”，再执行导出即可。默认可将符合筛选条件的未候选图片一并作为备选导出。
+
+## 周边商品图如何筛选？
+
+周边采集会查找商品详情并在未取得合格高清商品图时尝试补搜。候选会记录具体商品的关联、原图状态和商品页证据；图片仍需通过下载、尺寸和人工审核。Amazon 商品页会过滤其他商品推荐项。筛选结果需要人工确认，工具不承诺准确率。
 
 ## 命令行能选择栏目或启用 SocialData 吗？
 

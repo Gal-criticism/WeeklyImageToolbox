@@ -4,7 +4,7 @@
 
 ## Windows x64 便携版
 
-从[GitHub Releases 最新版本](https://github.com/kasumi-ppp/galgame-news/releases/latest)下载 `WeeklyImageToolbox-v1.0.0-windows-x64.zip`，解压后运行 `WeeklyImageToolbox.exe`。完整便携版无需安装 Python。v1.0.0 发布页：[查看发布说明](https://github.com/kasumi-ppp/galgame-news/releases/tag/v1.0.0)。
+Windows x64 v1.1.0 便携版从[GitHub Releases 最新版本](https://github.com/Gal-criticism/WeeklyImageToolbox/releases/latest)下载；[v1.1.0 发布说明](https://github.com/Gal-criticism/WeeklyImageToolbox/releases/tag/v1.1.0)。解压后运行 `WeeklyImageToolbox.exe`，无需安装 Python。
 
 首次使用建议保持 SocialData 关闭；该功能需要用户自行配置密钥并按任务启用，发行包不包含私测凭据。
 
@@ -23,7 +23,7 @@
 
 右侧可以查看图片、新闻信息和采集依据。“打开来源”会打开来源页面，“打开官网”打开作品官网（如果记录中有），“打开原图”打开记录中的媒体 URL；本地原件保留在任务目录中。视频页可用“播放视频”。
 
-点击“导出图片（含未候选）”后查看提示的导出路径，交付图片位于任务目录的 `final/images`。此目录包含已选图片与符合条件的未候选备选。`review_assets` 是审核内部资源目录，不是用户备选目录。原始文件、索引和审核状态会保留在任务结果中。
+导出时可选择是否“同时导出未候选图片”；交付图片位于任务目录的 `final/images`。`review_assets` 是审核内部资源目录，不是用户备选目录。原始文件、索引和审核状态会保留在任务结果中。
 
 暂停会等待在途请求完成当前工作；点“继续”接着处理。需要结束本轮时点“停止任务”，之后可从历史任务恢复续跑。
 

@@ -18,7 +18,7 @@ def create_application(argv: Sequence[str] | None = None, *, exit_handler=None) 
     if app is None:
         app = QApplication(list(argv) if argv is not None else sys.argv)
     app.setApplicationDisplayName("周报图片采集工具箱")
-    app.setApplicationVersion("1.0.0")
+    app.setApplicationVersion("1.1.0")
     controller = DesktopController()
     window = MainWindow(controller, exit_handler=exit_handler)
     try:

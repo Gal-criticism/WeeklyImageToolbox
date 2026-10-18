@@ -7,11 +7,11 @@
 <p align="center">从一份 DOCX 开始，采集新闻配图、检查来源，再由你决定最终选图。</p>
 
 <p align="center">
-  <a href="https://github.com/kasumi-ppp/galgame-news/releases/download/v1.0.0/WeeklyImageToolbox-v1.0.0-windows-x64.zip"><strong>下载 Windows x64 便携版 v1.0.0</strong></a>
-  · <a href="https://github.com/kasumi-ppp/galgame-news/releases/latest">查看最新版</a>
+  <a href="https://github.com/Gal-criticism/WeeklyImageToolbox/releases/download/v1.1.0/WeeklyImageToolbox-v1.1.0-windows-x64.zip"><strong>下载 Windows x64 便携版 v1.1.0</strong></a>
+  · <a href="https://github.com/Gal-criticism/WeeklyImageToolbox/releases/tag/v1.1.0">v1.1.0 发布说明</a>
 </p>
 
-解压后运行 `WeeklyImageToolbox.exe`。这是完整便携版，无需安装 Python。
+从上方链接下载 v1.1.0 便携版；解压后运行 `WeeklyImageToolbox.exe`，无需另装 Python。
 
 <p align="center">
   <img src="https://img.shields.io/badge/Windows-x64%20Portable-0078D6" alt="Windows x64 便携版">
@@ -23,7 +23,7 @@
   <a href="#快速开始">快速开始</a> ·
   <a href="docs/user/manual.md">使用手册</a> ·
   <a href="docs/user/faq.md">常见问题</a> ·
-  <a href="https://github.com/kasumi-ppp/galgame-news/issues">问题反馈</a>
+  <a href="https://github.com/Gal-criticism/WeeklyImageToolbox/issues">问题反馈</a>
 </p>
 
 适合需要整理新作、汉化和周报配图的编辑及测试用户。工具箱负责收集和整理候选，你可以逐条新闻检查已选图片与“未候选”备选，并导出确认后的结果。
@@ -55,12 +55,16 @@
 | --- | --- |
 | 新闻栏目选择 | 新作、汉化、周边独立勾选，保留原文档顺序与 `xN` / `hN` / `zN` 编号 |
 | 官网图片采集 | 发现相关作品页、图库与商品详情；动态图库可启用浏览器补充采集 |
+| 周边商品采集 | 查找商品详情与补搜图片，提供商品级关联证据；Amazon 商品页过滤推荐商品 |
 | 可选 X API | 配置自己的 SocialData 凭据后，按帖子提取媒体；每次任务默认关闭 |
 | 汉化配图 | 识别 VNDB 发行记录对应作品及 Steam 本作品截图，优先获取高清原图 |
 | 图片筛选 | 结合作品关联、图片级证据与原始质量筛选；确认同画面后在新闻内去重 |
 | 人工审核 | 已选、未候选／待复核、已排除和视频分页；支持多选、快捷键、缩放及来源入口 |
 | 图片交付 | PNG/JPG 审阅文件与新闻目录编号；合适的未候选备选随导出保留 |
 | 任务恢复 | 暂停、继续、停止，历史任务重新审核及可恢复媒体续跑 |
+| 任务存储 | SQLite 保存任务状态；旧任务可迁移，哈希资产复用并兼容 v1 任务 |
+| 媒体恢复 | 恢复已有 X 与 YouTube 媒体记录，不自动启用 SocialData 查询 |
+| 退出确认 | 有任务运行时关闭窗口先确认，确认后立即退出；空闲时直接关闭 |
 | 中文桌面界面 | 浅色、深色和跟随系统；中文进度摘要与可展开的技术详情 |
 
 X API 照片保留最高来源优先级，仍遵循新闻内去重和数量限制。SocialData 默认关闭，使用时需自行配置密钥并逐任务启用；发行包不含私测凭据。其他来源的高清图片也需要作品关联和图片证据，不能仅凭来自 VNDB、Steam 或官网就自动入选。
@@ -77,13 +81,13 @@ flowchart LR
 
 ## 快速开始
 
-下载 Windows x64 完整便携版：[WeeklyImageToolbox-v1.0.0-windows-x64.zip](https://github.com/kasumi-ppp/galgame-news/releases/download/v1.0.0/WeeklyImageToolbox-v1.0.0-windows-x64.zip)，或前往[最新版发布页](https://github.com/kasumi-ppp/galgame-news/releases/latest)。v1.0.0 [发布说明](https://github.com/kasumi-ppp/galgame-news/releases/tag/v1.0.0)。解压后运行 `WeeklyImageToolbox.exe`；完整包无需安装 Python。
+v1.1.0 Windows x64 便携版可从[最新版发布页](https://github.com/Gal-criticism/WeeklyImageToolbox/releases/latest)下载；查看[v1.1.0 发布说明](https://github.com/Gal-criticism/WeeklyImageToolbox/releases/tag/v1.1.0)。
 
 首次使用建议保持“跳过视频”选中，并让 SocialData 保持关闭。SocialData 需要自备密钥、逐任务启用，发行包不含任何私测凭据。需要脚本处理的用户可参考[手册中的 CLI 入口](docs/user/manual.md#命令行)。
 
 ## 图片与任务输出
 
-任务保留完整数据，以便后续审核、追溯来源和恢复。当前源码的新任务使用以下存储，`final/images` 的成品命名保持不变：
+任务保留完整数据，以便后续审核、追溯来源和恢复。v1.1.0 新任务使用以下存储，`final/images` 的成品命名保持不变：
 
 ```text
 output/<任务目录>/
@@ -95,9 +99,9 @@ output/<任务目录>/
 └─ final/images/         # xN、hN、zN 已选及未候选备选
 ```
 
-旧任务不会自动迁移。可在历史任务页选择“迁移任务存储”；原文件仍会保留。迁移、检查与整任务备份见[任务存储说明](docs/user/storage.md)。现有便携版需重新构建才包含此改动。
+v1 旧任务保持可打开和可审核；需要使用 SQLite 时，可在历史任务页选择“迁移任务存储”。迁移不会删除旧文件。迁移、检查与整任务备份见[任务存储说明](docs/user/storage.md)。
 
-旧版任务及尚未重新构建的便携版仍采用下列结构（其他文件按任务情况生成）：
+尚未迁移的 v1 旧任务仍采用下列结构（其他文件按任务情况生成）：
 
 ```text
 output/<任务目录>/
@@ -135,4 +139,4 @@ output/<任务目录>/
 - [使用手册](docs/user/manual.md)：新建任务、审核、导出与历史恢复。
 - [常见问题](docs/user/faq.md)：X 缺图、未候选、导出失败与目录问题。
 - [构建说明](packaging/README.md)：面向维护者的 Windows 打包流程。
-- [提交问题](https://github.com/kasumi-ppp/galgame-news/issues)：请附操作步骤、版本、脱敏截图和必要诊断。
+- [提交问题](https://github.com/Gal-criticism/WeeklyImageToolbox/issues)：请附操作步骤、版本、脱敏截图和必要诊断。
