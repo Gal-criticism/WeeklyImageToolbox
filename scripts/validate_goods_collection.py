@@ -37,7 +37,7 @@ from galgame_news.discovery.goods_service import GoodsSourceService, goods_page_
 from galgame_news.discovery.http import SafeHttpClient
 from galgame_news.discovery.product_navigation import product_links
 from galgame_news.discovery.resolver import DefaultSourceResolver
-from galgame_news.domain import (CollectionContext, CollectionResult, DiscoveryMethod,
+from galgame_news.domain import (SourceRef, CollectionContext, CollectionResult, DiscoveryMethod,
                                  ImageCandidate, Issue, NewsItem,
                                  SourceType)
 from galgame_news.pipeline.contracts import TaskRequest
@@ -62,7 +62,7 @@ class HttpResponse:
 
 
 def normalized_url(url: str) -> str:
-    p = urlsplit(str(url))
+    p = urlsplit(unwrap_goods_url(str(url)))
     return p._replace(fragment="").geturl()
 
 
@@ -175,7 +175,8 @@ def freeze_baseline_originals(candidates, baseline_root: Path, output_root: Path
 
 
 class FrozenStore:
-    def __init__(self, output_root: Path, *, fetch_enabled: bool = False):
+    def __init__(self, output_root: Path, *, fetch_enabled: bool = False, live_replay: bool = False):
+        self.live_replay = live_replay
         self.root = output_root / "fixtures"
         self.fetch_enabled = fetch_enabled
         self.pages: dict[str, HttpResponse] = {}
@@ -231,6 +232,14 @@ class FrozenStore:
 
     def source_transport(self, url, **_kwargs):
         key = normalized_url(url)
+        if key not in self.pages and self.live_replay:
+            if is_x_url(url):
+                raise ValueError("live X requests are forbidden in cached validation")
+            response = _fetch(SafeHttpClient(timeout=10, max_retries=0, max_response_bytes=MAX_PAGE_BYTES),
+                              url, max_bytes=MAX_PAGE_BYTES, store=self, kind="page")
+            if response is not None:
+                return response
+            self.pages[key] = HttpResponse(url, 599, b"fetch_failed")
         if key not in self.pages:
             self.statuses.setdefault(key, {"kind": "page", "status": "fixture_missing", "reason": "closed_world_replay"})
             return HttpResponse(url, 599, b"fixture_missing")
@@ -238,6 +247,12 @@ class FrozenStore:
 
     def image_transport(self, url, **_kwargs):
         key = normalized_url(url)
+        if key not in self.images and self.live_replay:
+            response = _fetch(SafeHttpClient(timeout=10, max_retries=0, max_response_bytes=MAX_IMAGE_BYTES),
+                              url, max_bytes=MAX_IMAGE_BYTES, store=self, kind="image")
+            if response is not None:
+                return response
+            self.images[key] = HttpResponse(url, 599, b"fetch_failed")
         if key not in self.images:
             self.statuses.setdefault(key, {"kind": "image", "status": "fixture_missing", "reason": "closed_world_replay"})
             return HttpResponse(url, 599, b"fixture_missing")
@@ -398,8 +413,9 @@ class FrozenAnalyzer:
 
 
 class ReplayRunner(PipelineRunner):
-    def __init__(self, *, issue, input_path, x_candidates, posts, store, config):
-        super().__init__(analyzer=FrozenAnalyzer(issue, input_path), resolver=object(), config=config,
+    def __init__(self, *, issue, input_path, x_candidates, posts, store, config, search_provider=None):
+        super().__init__(analyzer=FrozenAnalyzer(issue, input_path),
+                         resolver=DefaultSourceResolver(search_provider=search_provider or (lambda news: [])), config=config,
                          source_transport=store.source_transport, image_transport=store.image_transport,
                          adapter_factory=None)
         self.frozen_x_candidates = x_candidates
@@ -545,8 +561,11 @@ def main(argv=None):
     parser.add_argument("--input", type=Path, required=True, help="Original DOCX used by the baseline task")
     parser.add_argument("--output", type=Path, required=True, help="New, empty validation output root")
     parser.add_argument("--fetch", action="store_true", help="Fetch bounded public HTML/images, then replay from frozen fixtures")
+    parser.add_argument("--search", action="store_true", help="Validate conditional public goods search; use --fetch or frozen --reuse-fixtures; no paid API")
     parser.add_argument("--reuse-fixtures", type=Path, help="Reuse an earlier validation's public fixtures before fetching missing resources")
     args = parser.parse_args(argv)
+    if args.search and not (args.fetch or args.reuse_fixtures):
+        parser.error("--search requires --fetch or --reuse-fixtures")
     baseline = args.baseline_task.expanduser().resolve()
     docx = args.input.expanduser().resolve()
     output = args.output.expanduser().resolve()
@@ -572,7 +591,7 @@ def main(argv=None):
     freeze_baseline_originals(baseline_candidates, baseline, output, failures)
     frozen_news = [item for item in all_news if item in goods_news]
     frozen_issue = Issue(issue_id=issue_id or str(goods_news[0].issue_id), input_path=str(docx), news_items=frozen_news)
-    store = FrozenStore(output, fetch_enabled=args.fetch)
+    store = FrozenStore(output, fetch_enabled=args.fetch, live_replay=args.search and args.fetch)
     if args.reuse_fixtures:
         store.load(args.reuse_fixtures)
     for candidate in baseline_candidates:
@@ -598,8 +617,21 @@ def main(argv=None):
     config.network.timeout_seconds = 10
     config.filters.max_response_bytes = MAX_PAGE_BYTES
     config.filters.max_image_bytes = MAX_IMAGE_BYTES
+    searches = {}
+    cached_searches = {}
+    if args.reuse_fixtures and (args.reuse_fixtures / "search_results.json").is_file():
+        cached_searches = json.loads((args.reuse_fixtures / "search_results.json").read_text("utf-8"))
+    def search_provider(news):
+        from galgame_news.discovery.search import DDGSSearchProvider, _search_queries
+        rows = ([SourceRef.model_validate(r) for r in cached_searches[news.id]["results"]]
+                if news.id in cached_searches else (DDGSSearchProvider(max_results=5, timeout=8).search(news) if args.fetch else []))
+        searches[news.id] = {"title": news.title, "queries": list(_search_queries(news)),
+                             "results": [r.model_dump(mode="json") for r in rows], "reused": news.id in cached_searches}
+        (output / "search_results.json").write_text(json.dumps(searches, ensure_ascii=False, indent=2), encoding="utf-8")
+        return rows
     runner = ReplayRunner(issue=frozen_issue, input_path=docx, x_candidates=x_candidates,
-                          posts=posts, store=store, config=config)
+                          posts=posts, store=store, config=config,
+                          search_provider=search_provider if args.search else None)
     request = TaskRequest(input_path=docx, issue_id=frozen_issue.issue_id, output_dir=output / "replay",
                           no_videos=True, use_socialdata_x=False, selected_sections=["z"])
     task_result = runner.run(request)
@@ -625,7 +657,8 @@ def main(argv=None):
                   sample_result, ignored_news_fields)
     metrics = {"runner": runner.network_metrics, "public_html_fetches": sum(v.get("kind") == "page" for v in store.statuses.values()),
                "public_image_fetches": sum(v.get("kind") == "image" for v in store.statuses.values()), "api_calls": 0,
-               "task_status": task_result.status, "task_id": task_result.task_id}
+               "task_status": task_result.status, "task_id": task_result.task_id,
+               "goods_search_news_count": len(searches)}
     (output / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Validation artifacts written to {output}")
     print(f"Task status: {task_result.status}; API calls: 0; report: {output / 'report.html'}")

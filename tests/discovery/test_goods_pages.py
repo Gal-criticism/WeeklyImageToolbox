@@ -33,7 +33,9 @@ def test_amazon_dynamic_image_json_and_asin():
     html = '''<title>フィギュア</title><img id="landingImage" src="thumb.jpg" data-a-dynamic-image='{"https://img/large.jpg":[1200,1600],"https://img/small.jpg":[400,500]}'><a href="/dp/B000000001">商品</a>'''
     result = parse_goods_page(html, "https://www.amazon.co.jp/dp/B000000001")
     assert any(i.url.endswith("large.jpg") and i.thumbnail_url.endswith("thumb.jpg") for i in result.images)
-    assert result.links[0].item_id == "B000000001"
+    assert result.images[0].item_id == "B000000001"
+    assert not result.images[0].original  # largest display variant is not proof of an original
+    assert result.links == []
 
 
 def test_dmm_and_dlsite_detail_identifiers():
@@ -132,3 +134,28 @@ def test_figsoku_primary_product_excludes_main_recommendations_and_article_tease
     result = parse_goods_page(html, "https://figsoku-b.net/blog-entry-13167")
     assert [image.url for image in result.images] == ["https://figsoku-b.net/original.jpg"]
     assert result.images[0].role == "reference"
+
+
+def test_amazon_detail_excludes_recommended_products_and_their_images():
+    html = """<h1 id="productTitle">Main figure</h1>
+    <img id="landingImage" src="small.jpg" data-old-hires="/main-original.jpg">
+    <div id="sims-consolidated-1_feature_div"><a href="/dp/B000000002">
+    <div class="product"><img data-large="/other.jpg" alt="Other figure"></div></a></div>"""
+    result = parse_goods_page(html, "https://www.amazon.co.jp/dp/B000000001")
+    assert [i.url for i in result.images] == ["https://www.amazon.co.jp/main-original.jpg"]
+    assert result.images[0].original
+    assert result.links == []
+
+
+def test_amazon_product_links_are_canonicalized_on_listing_only():
+    result = parse_goods_page('<a href="/a-title/dp/B000000001/ref=abc?tag=tracking">Figure</a>',
+                              "https://www.amazon.co.jp/s?me=shop")
+    assert [link.url for link in result.links] == ["https://www.amazon.co.jp/dp/B000000001"]
+
+
+def test_fantia_site_market_promotion_inside_product_body_is_not_a_product_image():
+    html = """<h1>Product</h1><div class="product-body"><div class="product-images">
+    <img data-original="/uploads/product/main.jpg" src="/uploads/product/thumb.jpg"></div>
+    <img src="/images/market/market_lead_banner.jpg" alt="FantiaMarket"></div>"""
+    page = parse_goods_page(html, "https://fantia.jp/products/118217")
+    assert [i.url for i in page.images] == ["https://fantia.jp/uploads/product/main.jpg"]

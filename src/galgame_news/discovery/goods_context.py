@@ -33,6 +33,11 @@ def unwrap_goods_url(url: str) -> str:
         try:
             parts = urlsplit(current)
             host = (parts.hostname or "").casefold()
+            if (parts.scheme in {"http", "https"} and not parts.username and not parts.password
+                    and host.removeprefix("www.") in {"amazon.co.jp", "amazon.jp"}):
+                asin = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:/|$)", parts.path, re.I)
+                if asin:
+                    return f"https://www.amazon.co.jp/dp/{asin[1].upper()}"
             if "/age_check/" in parts.path:
                 break
             if not (host == "rcv.ixd.dmm.com" or host.endswith(".dmm.com") or host.endswith(".dmm.co.jp")):
@@ -69,7 +74,7 @@ def has_item_evidence(candidate) -> bool:
     ) for e in candidate.evidence)
 
 
-def association(news, *, url: str, title: str, work="", maker="", activity="", root="", item_id="") -> tuple[str, str]:
+def association(news, *, url: str, title: str, work="", maker="", activity="", root="", item_id="", require_specific=False) -> tuple[str, str]:
     """A store or brand alone never establishes the product's relationship."""
     local = compact(" ".join((title, work, activity)))
     explicit = [unwrap_goods_url(u) for u in news.source_urls]
@@ -93,6 +98,23 @@ def association(news, *, url: str, title: str, work="", maker="", activity="", r
                  and not re.fullmatch(r"周边|商品|グッズ|手办|フィギュア|ASMR|联动|抽奖", p, re.I)]
     specific_match = any(compact(p) in local for p in specifics)
     event_match = bool(activity and len(compact(activity)) >= 4 and compact(activity) in news_text)
+    if require_specific and (work_match or specific_match or event_match):
+        # Public search can return an old game or another product of the same
+        # work. Product/activity identity must survive the search expansion.
+        news_description = news.title + " " + news.body
+        requirements = (
+            (r"手办|手辦|フィギュア|figure", r"フィギュア|figure|PVC|完成品|スケール|1/\d"),
+            (r"抽奖|抽選|くじ|lottery", r"くじ|抽選|lottery"),
+            (r"ASMR|音声作品", r"ASMR|音声|ボイス"),
+            (r"咖啡|カフェ|cafe", r"カフェ|cafe|コラボ"),
+            (r"快闪|快閃|ポップアップ|popup", r"ポップアップ|popup|フェア|pop.up"),
+        )
+        if any(re.search(wanted, news_description, re.I) and not re.search(proof, title + " " + activity, re.I)
+               for wanted, proof in requirements):
+            return "uncertain", "补搜结果仅匹配作品，缺少新闻所述商品种类或活动证据"
+        anniversary = re.search(r"(\d+)\s*周年", news_description)
+        if anniversary and not re.search(re.escape(anniversary[1]) + r"\s*周年", title + " " + activity):
+            return "uncertain", "补搜结果缺少本次周年活动证据"
     if work_match or specific_match or event_match:
         return "matched", "商品局部标题、作品或活动与新闻一致"
     if work and names and all(compact(n) not in compact(work) and compact(work) not in compact(n) for n in names):

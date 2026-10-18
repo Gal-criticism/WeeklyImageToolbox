@@ -67,3 +67,17 @@ def test_failed_source_retains_url_without_fake_image():
     assert result.candidates == []
     assert result.failures[0].source_url == url
     assert not result.failures[0].retryable
+
+
+def test_goods_search_requires_news_product_kind_and_anniversary():
+    from galgame_news.discovery.goods_context import association, unwrap_goods_url
+    from galgame_news.domain import NewsItem, EventType
+    news = NewsItem(issue_id="test", sequence=1, section="周边", title="《School Days》20周年手办",
+                    body="", game_names=["School Days"], event_type=EventType.GOODS)
+    def match(title):
+        return association(news, url="https://www.amazon.co.jp/dp/B000000001", title=title,
+                           require_specific=True)[0]
+    assert match("School Days game") == "uncertain"
+    assert match("School Days フィギュア") == "uncertain"
+    assert match("School Days 20周年 フィギュア") == "matched"
+    assert unwrap_goods_url("https://www.amazon.co.jp/name/dp/B000000001/ref=abc?tag=x") == "https://www.amazon.co.jp/dp/B000000001"

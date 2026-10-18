@@ -612,6 +612,37 @@ class PipelineRunner:
                         candidates = [candidate for candidate in candidates if candidate.news_id != news.id]
                         candidates.extend(accepted)
                         failures.extend(value for value in download_failures if value not in failures)
+                        # Goods search depends on decoded native assets, not on
+                        # X attachment presence or unverified page dimensions.
+                        from .goods_collection import search_goods_after_download
+                        extra_sources, extra_results = await search_goods_after_download(
+                            self._network_runtime, news, news_sources, request, accepted,
+                        )
+                        extra_candidates = []
+                        for collection in extra_results:
+                            extra_candidates.extend(collection.candidates)
+                            news_videos.extend(collection.video_candidates)
+                            failures.extend(collection.failures)
+                        if extra_sources:
+                            source_map[news.id] = news_sources
+                            self._emit(sink, failures, self._event(
+                                "collect_completed", task_id, issue.issue_id, news_id=news.id,
+                                news_index=news_index, total_news=total_news,
+                                message=f"商品补搜新增 {len(extra_sources)} 个来源、{len(extra_candidates)} 张候选图片",
+                            ))
+                        if extra_candidates:
+                            # Persist every newly discovered URL before
+                            # download, with the same recovery coordinator.
+                            candidates = journal.merge(candidates, extra_candidates)
+                            await save_downloads(news.id, candidates)
+                            await commit_checkpoint()
+                            downloaded, extra_failures = await self._network_runtime.download(
+                                extra_candidates, self._image_stage(task_dir), on_result=recorded,
+                            )
+                            accepted = journal.merge(accepted, downloaded)
+                            candidates = [c for c in candidates if c.news_id != news.id]
+                            candidates.extend(accepted)
+                            failures.extend(value for value in extra_failures if value not in failures)
                         # A single network request may finish while pause is
                         # requested; honor it immediately after the call.
                         await token.wait_if_paused_async()

@@ -189,6 +189,8 @@ def parse_goods_page(html: str, page_url: str) -> GoodsPage:
     if not site: return page
     # Amazon has a product-specific JSON object; parse JSON data only.
     if site == "amazon_jp":
+        title = _text(soup.select_one("#productTitle")) or title
+        page.title = title
         for script in soup.find_all("script"):
             raw = script.string or script.get_text()
             m = re.search(r"(?:'colorImages'|\"colorImages\")\s*:\s*(\{)", raw)
@@ -213,7 +215,7 @@ def parse_goods_page(html: str, page_url: str) -> GoodsPage:
                     for entry in arr:
                         if not isinstance(entry, dict): continue
                         u = entry.get("hiRes") or entry.get("large") or entry.get("main")
-                        if u and _url(u,page_url): page.images.append(GoodsImage(_url(u, page_url), title=title, role="main", original=True))
+                        if u and _url(u,page_url): page.images.append(GoodsImage(_url(u, page_url), title=title, role="main", original=bool(entry.get("hiRes"))))
                 except (ValueError, TypeError, AttributeError): pass
         for node in soup.select("#landingImage, #imgTagWrapperId img"):
             raw = node.get("data-a-dynamic-image")
@@ -224,7 +226,7 @@ def parse_goods_page(html: str, page_url: str) -> GoodsPage:
                         valid = [u for u, dims in imgs.items() if isinstance(dims,list) and len(dims)>=2 and all(isinstance(n,(int,float)) for n in dims[:2])]
                         if valid:
                             u = max(valid, key=lambda x: imgs[x][0] * imgs[x][1])
-                            page.images.append(GoodsImage(_url(u, page_url), thumbnail_url=_url(_attr(node,"src"),page_url), title=title))
+                            page.images.append(GoodsImage(_url(u, page_url), thumbnail_url=_url(_attr(node,"src"),page_url), title=title, original=False))
                 except (ValueError, TypeError, KeyError, AttributeError): pass
     # Product structured data is accepted only when it is the page's primary Product.
     for script in soup.select('script[type="application/ld+json"]'):
@@ -248,6 +250,10 @@ def parse_goods_page(html: str, page_url: str) -> GoodsPage:
     # Link and image extraction uses only scoped product/article/card containers.
     for a in soup.find_all("a", href=True):
         if _excluded(a): continue
+        if site == "amazon_jp" and _is_detail_page(page_url, site):
+            # Other ASINs on a detail page are recommendations, not navigation
+            # within the current news product, even when the work name matches.
+            continue
         href = _url(str(a["href"]), page_url)
         if site == "eeo" and "login_redirect" in urlsplit(href).path:
             redirect = parse_qs(urlsplit(href).query).get("url", [""])[0]
@@ -270,10 +276,17 @@ def parse_goods_page(html: str, page_url: str) -> GoodsPage:
                  (site == "fantia" and ("/posts/" in path or "/products/" in path)))
         if valid:
             item = _item_id(href,site)
+            if site == "amazon_jp" and item:
+                href = f"https://www.amazon.co.jp/dp/{item}"
             if not any(x.url == href for x in page.links): page.links.append(GoodsLink(href,text,item))
     # Product detail/gallery images: recommendations and general page chrome were filtered above.
     for img in soup.find_all("img"):
         if _excluded(img): continue
+        if site == "fantia" and urlsplit(_url(str(img.get("src") or ""), page_url)).path == "/images/market/market_lead_banner.jpg":
+            # Site-wide market promotion embedded even inside product-body.
+            continue
+        if site == "amazon_jp" and not (img.get("id") == "landingImage" or img.find_parent(id="imgTagWrapperId")):
+            continue
         container = img.parent
         card = img.find_parent(class_=re.compile(r"product|goods|item|card|prize|gallery|main_image|main-image|ec-productRole__listItem",re.I))
         detail_selectors = {
@@ -308,6 +321,9 @@ def parse_goods_page(html: str, page_url: str) -> GoodsPage:
         local_item = _item_id(_url(str(local_link.get("href")),page_url),site) if local_link else _item_id(page_url,site)
         context = " ".join((_text(container), _attr(img,"alt","title"), str(img.get("class") or "")))
         best, thumb = _highres(img,page_url)
+        amazon_original = _url(str(img.get("data-old-hires") or ""), page_url) if site == "amazon_jp" else ""
+        if amazon_original:
+            best = amazon_original
         if not best: continue
         explicit = any(img.get(k) for k in ("data-large","data-zoom-image","data-original","data-full","data-hires","srcset","data-srcset")) or bool(img.find_parent("picture") and img.find_parent("picture").find("source", srcset=True))
         anchor_url = _url(str(anc.get("href")),page_url) if anc else ""
@@ -319,7 +335,7 @@ def parse_goods_page(html: str, page_url: str) -> GoodsPage:
         # verified primary slider, explicit large-resource data and direct
         # image links prove a full resource here; other previews stay manual.
         confirmed_main = site == "eeo" and _has_scope(img, r"shouhinshousai-slide|ec-sliderItemRole")
-        original = bool(explicit or image_like or confirmed_main or article_reference)
+        original = bool(explicit or image_like or confirmed_main or article_reference or amazon_original)
         if not original and not article_reference and not list_card and not generic_gallery:
             continue
         stage = "prototype" if site == "figsoku-b" and re.search(r"prototype|試作品|原型", context, re.I) else ""

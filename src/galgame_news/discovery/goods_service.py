@@ -120,7 +120,8 @@ class GoodsSourceService:
                 seller = parse_qs(urlsplit(source.root_url or source.url).query).get("me", [""])[0]
             binding, reason = association(news, url=page_url, title=image.title,
                 work=image.work, maker=image.maker, activity=image.activity,
-                item_id=identity, root=source.root_url or source.url)
+                item_id=identity, root=source.root_url or source.url,
+                require_specific=source.navigation_kind == "goods_search")
             candidate = _candidate(news, image.url, source, context)
             candidate.parent_source_url = page_url
             candidate.image_alt = image.title
@@ -173,7 +174,8 @@ class GoodsSourceService:
                 ranked.append((target, link.title, "goods_listing"))
                 continue
             binding, _ = association(news, url=target, title=link.title,
-                item_id=link.item_id, root=source.root_url or source.url)
+                item_id=link.item_id, root=source.root_url or source.url,
+                require_specific=source.navigation_kind == "goods_search")
             if binding != "matched":
                 continue
             ranked.append((target, link.title, "goods"))

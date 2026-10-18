@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+
+from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
@@ -12,9 +16,107 @@ from ..discovery.goods_service import GoodsSourceService, page_problem, goods_pa
 from ..discovery.product_navigation import product_links
 from ..discovery.resolver import DefaultSourceResolver, _normalize, _is_media_url
 from ..domain import CollectionResult, DiscoveryMethod, FailureRecord, FailureStage, SourceType
+from .contracts import CancellationRequested
 
 
-async def collect_goods(runtime, news, sources, request):
+@dataclass
+class GoodsCollectionState:
+    seen: set[str] = field(default_factory=set)
+    pages: int = 0
+    searched: bool = False
+
+
+def has_qualified_goods(news, candidates, config):
+    """Only verified native merchant images can satisfy the search stop rule.
+
+    HTML dimensions and the presence of an X attachment are insufficient. The
+    downloader has already decoded and hashed successful assets at this stage.
+    Reuse the existing entity/type policies rather than inventing weaker ones.
+    """
+    from ..curation.entity_matching import EntityMatcher
+    from ..curation.image_typing import ImageTypeClassifier
+    from ..curation.source_policy import SourceTrustPolicy
+    from ..domain import ImageType
+    classifier = ImageTypeClassifier(config.image_types)
+    for candidate in candidates:
+        signals = candidate.signals
+        width, height = candidate.original_width or 0, candidate.original_height or 0
+        if (candidate.news_id != news.id or candidate.download_status != "downloaded"
+                or not candidate.original_sha256 or not candidate.original_path
+                or signals.get("goods_context") is not True
+                or signals.get("goods_association") != "matched"
+                or signals.get("goods_original") is not True
+                or signals.get("goods_reference") is True or signals.get("goods_role") == "reference"
+                or candidate.source_type is SourceType.OFFICIAL_X
+                or signals.get("x_api_photo") is True or signals.get("socialdata_photo") is True
+                or signals.get("invalid_reason") or signals.get("conversion_error")
+                or candidate.animated_source or signals.get("animated_source") is True
+                or max(width, height) < 800 or min(width, height) < 600
+                or width < config.filters.min_width or height < config.filters.min_height
+                or width * height < config.filters.min_pixels):
+            continue
+        if not Path(candidate.original_path).is_file():
+            continue
+        typed = classifier.classify(news, candidate)
+        if (typed.image_type is ImageType.GOODS and typed.confidence >= 0.8
+                and EntityMatcher().match(news, candidate).matched is True
+                and SourceTrustPolicy().classify(candidate).tier == "official_store"):
+            return True
+    return False
+
+
+async def search_goods_after_download(runtime, news, sources, request, candidates):
+    """One bounded public search after download; never re-collect X sources."""
+    from ..discovery.goods_context import is_goods_news
+    state = getattr(runtime, "_goods_states", {}).get(news.id)
+    if (state is None and not request.offline and is_goods_news(news)
+            and runtime.runner.adapter_factory is None):
+        # Media-only recovery must also finish a search interrupted after the
+        # initial download. Reuse recorded sources and assets, never X queries.
+        state = GoodsCollectionState(
+            seen={_normalize(unwrap_goods_url(s.url)) for s in sources},
+            pages=sum(s.source_type not in {SourceType.OFFICIAL_X, SourceType.VIDEO, SourceType.DIRECT_IMAGE} for s in sources),
+            searched=any(s.navigation_kind == "goods_search" for s in sources),
+        )
+        runtime._goods_states = {news.id: state}
+    resolver = runtime.runner.resolver
+    if (state is None or state.searched or request.offline
+            or getattr(runtime.runner, "_supplement_mode", False)
+            or not isinstance(resolver, DefaultSourceResolver)):
+        return [], []
+    state.searched = True
+    if await runtime.call_sync(lambda: has_qualified_goods(news, candidates, runtime.runner.config)):
+        return [], []
+    if state.pages >= 16:
+        return [], [CollectionResult(failures=[FailureRecord(stage=FailureStage.RESOLVE,
+            news_id=news.id, code="goods_search_budget_exhausted",
+            message="尚未取得合格高清商品图，但商品采集已达 16 页上限，未继续补搜。", retryable=False)])]
+    try:
+        fallback = await runtime.call_sync(lambda: list(resolver.search_provider(news)))
+        extra = []
+        for source in fallback:
+            if goods_site(source.url) and _normalize(unwrap_goods_url(source.url)) not in state.seen:
+                source.navigation_kind = "goods_search"
+                source.root_url = news.source_urls[0] if news.source_urls else source.url
+                source.source_chain = list(dict.fromkeys([source.root_url, source.url]))
+                # Search discovery is evidence of discovery, never officiality.
+                extra.append(source)
+        if not extra:
+            return [], [CollectionResult(failures=[FailureRecord(stage=FailureStage.RESOLVE,
+                news_id=news.id, code="goods_search_no_results",
+                message="未取得合格高清商品图；商品补搜未返回新的受支持商城链接。", retryable=True)])]
+        results = await collect_goods(runtime, news, extra, request, _state=state)
+        sources.extend(extra)
+        return extra, results
+    except (CancellationRequested, asyncio.CancelledError):
+        raise
+    except Exception as exc:
+        return [], [CollectionResult(failures=[FailureRecord(stage=FailureStage.RESOLVE,
+            news_id=news.id, code="goods_search_failed",
+            message=f"商品补充搜索失败（{type(exc).__name__}），已取得的图片仍保留。", retryable=True)])]
+
+
+async def collect_goods(runtime, news, sources, request, *, _state=None):
     """Expand in input order, sharing one 16-page/3-level budget across stages.
 
     ``sources`` is the coordinator-owned source-map list, extended alongside
@@ -24,12 +126,13 @@ async def collect_goods(runtime, news, sources, request):
     pending = list(sources)
     sources.clear()
     results = []
-    seen = set()
-    pages = 0
-    searched = False
+    state = _state or GoodsCollectionState()
+    seen = state.seen
     max_depth = min(3, runner.config.search.same_domain_depth)
-    runtime._source_responses.clear()
-    runtime._goods_snapshots = {}
+    if _state is None:
+        runtime._goods_states = {news.id: state}
+        runtime._source_responses.clear()
+        runtime._goods_snapshots = {}
 
     def failure(source, code, message, retryable=False):
         return FailureRecord(stage=FailureStage.RESOLVE, news_id=news.id,
@@ -43,7 +146,7 @@ async def collect_goods(runtime, news, sources, request):
         source.source_chain = list(dict.fromkeys(u for u in [root, parent, source.url] if u))
         return source
 
-    while pending or not searched:
+    while pending:
         await token.wait_if_paused_async()
         batch = []
         budget_skipped = []
@@ -58,10 +161,10 @@ async def collect_goods(runtime, news, sources, request):
                 source.domain = urlsplit(key).hostname or source.domain
             is_page = source.source_type not in {SourceType.OFFICIAL_X, SourceType.VIDEO, SourceType.DIRECT_IMAGE}
             if is_page:
-                if pages >= 16:
+                if state.pages >= 16:
                     budget_skipped.append(source)
                     continue
-                pages += 1
+                state.pages += 1
             batch.append(source)
         pending = []
         if budget_skipped:
@@ -114,11 +217,13 @@ async def collect_goods(runtime, news, sources, request):
                             continue
                         child = seed(url, str(response.url), source.root_url or source.url,
                             label, source.navigation_depth + 1)
-                        child.navigation_kind = kind
+                        child.navigation_kind = "goods_search" if source.navigation_kind == "goods_search" else kind
                         child.source_chain = list(dict.fromkeys([
                             *(source.source_chain or [source.root_url or source.url]),
                             str(response.url), child.url]))
                         pending.append(child)
+                except (CancellationRequested, asyncio.CancelledError):
+                    raise
                 except Exception as exc:
                     result.failures.append(failure(source, "goods_navigation_failed",
                         f"商品详情导航失败（{type(exc).__name__}），已取得的图片仍保留。", True))
@@ -127,28 +232,4 @@ async def collect_goods(runtime, news, sources, request):
         for url, post in cached_product_urls(runner._socialdata_response_cache, news):
             if goods_site(url) and _normalize(url) not in seen:
                 pending.append(seed(url, post, post, "本条新闻 X 缓存商品链接"))
-        if pending:
-            continue
-        if searched:
-            break
-        searched = True
-        has_related = any(c.signals.get("goods_association") == "matched" and c.signals.get("goods_original") is True
-                          or c.signals.get("x_api_photo") is True or c.signals.get("socialdata_photo") is True
-                          for r in results for c in r.candidates)
-        resolver = runner.resolver
-        if not has_related and pages < 16 and not getattr(runner, "_supplement_mode", False) and isinstance(resolver, DefaultSourceResolver):
-            try:
-                fallback = await runtime.call_sync(lambda: list(resolver.search_provider(news)))
-                root = news.source_urls[0] if news.source_urls else ""
-                for source in fallback:
-                    # Restrict fallback to supported product stores. A generic
-                    # search hit is not an official work or a product identity.
-                    if goods_site(source.url) and _normalize(source.url) not in seen:
-                        source.root_url = root or source.url
-                        source.navigation_kind = "goods_search"
-                        pending.append(source)
-            except Exception as exc:
-                if results:
-                    results[0].failures.append(failure(sources[0], "goods_search_failed",
-                        f"商品补充搜索失败（{type(exc).__name__}），已取得的来源仍保留。", True))
     return results

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+from datetime import datetime, timezone
 
 from PIL import Image
 import pytest
 
 from galgame_news.domain import (
-    EventType, ImageNeed, Issue, IssueDraft, NewsDraft, NewsItem,
+    CollectionResult, EventType, ImageCandidate, ImageNeed, Issue, IssueDraft, NewsDraft, NewsItem,
     SourceRef, SourceType,
 )
 from galgame_news.pipeline import PipelineRunner, TaskRequest
@@ -43,13 +44,14 @@ class _Resolver:
                           root_url=url) for url in self.urls]
 
 
-def _image_bytes(image_format="JPEG"):
+def _image_bytes(image_format="JPEG", size=(1200, 900)):
     buffer = BytesIO()
-    Image.new("RGB", (1200, 900), "navy").save(buffer, format=image_format)
+    Image.new("RGB", size, "navy").save(buffer, format=image_format)
     return buffer.getvalue()
 
 
-def _runner(tmp_path, pages, image_urls=(), source_urls=None, *, parser=None, resolver=None):
+def _runner(tmp_path, pages, image_urls=(), source_urls=None, *, parser=None, resolver=None,
+            image_size=(1200, 900), image_sizes=None, failed_images=()):
     requests = []
 
     def source_transport(url, **_kwargs):
@@ -60,15 +62,118 @@ def _runner(tmp_path, pages, image_urls=(), source_urls=None, *, parser=None, re
 
     def image_transport(url, **_kwargs):
         assert url in image_urls, f"unexpected image request: {url}"
+        if url in failed_images:
+            raise OSError("fixture download failure")
         image_format = "PNG" if url.lower().endswith(".png") else "JPEG"
         content_type = "image/png" if image_format == "PNG" else "image/jpeg"
-        return type("Response", (), {"content": _image_bytes(image_format), "headers": {"content-type": content_type},
+        size = (image_sizes or {}).get(url, image_size)
+        return type("Response", (), {"content": _image_bytes(image_format, size), "headers": {"content-type": content_type},
             "status_code": 200, "url": url})()
 
     urls = list(source_urls if source_urls is not None else pages)
     runner = PipelineRunner(parser=parser or _Parser(), analyzer=_Analyzer(), resolver=resolver or _Resolver(urls),
                             source_transport=source_transport, image_transport=image_transport)
     return runner, requests
+
+
+@pytest.mark.parametrize("image_mode", ["undersized", "download_failed"])
+def test_unqualified_initial_goods_image_triggers_injected_search_and_indexes_search_result(tmp_path, image_mode):
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    listing = "https://www.getchu.com/feature/"
+    detail = "https://www.getchu.com/soft.phtml?id=42"
+    searched = "https://www.getchu.com/soft.phtml?id=77"
+    initial_image = "https://www.getchu.com/images/preview.jpg"
+    searched_image = "https://www.getchu.com/images/full.jpg"
+    pages = {
+        listing: (200, '<div class="ec-productRole__listItem"><a href="/soft.phtml?id=42">School Days acrylic figure</a></div>'),
+        detail: (200, '<h1>School Days acrylic figure</h1><div class="gallery"><a href="/images/preview.jpg">original</a><img src="/images/preview.jpg" alt="School Days acrylic figure"></div>'),
+        searched: (200, '<h1>School Days acrylic figure</h1><div class="gallery"><a href="/images/full.jpg"><img src="/images/full.jpg" alt="School Days acrylic figure"></a></div>'),
+    }
+    search_calls = []
+    resolver = DefaultSourceResolver(search_provider=lambda _news: search_calls.append(True) or [
+        SourceRef(url=searched, domain="getchu.com", source_type=SourceType.OFFICIAL_SITE)])
+    if image_mode == "undersized":
+        image_size, failed = (1200, 900), ()
+        image_sizes = {initial_image: (400, 300), searched_image: (1200, 900)}
+    else:
+        image_size, failed = (1200, 900), (initial_image,)
+        image_sizes = None
+    runner, requested = _runner(tmp_path, pages, [initial_image, searched_image], [listing], resolver=resolver,
+                                 image_size=image_size, image_sizes=image_sizes, failed_images=failed)
+    result = _run(tmp_path, runner, image_mode)
+
+    assert result.status == "completed"
+    assert search_calls == [True]
+    assert searched in requested
+    searched_candidates = [c for c in result.pipeline_result.candidates if c.source_url == searched]
+    assert any(c.original_path and Path(c.original_path).is_file()
+               and (c.original_width or 0) >= 800 and (c.original_height or 0) >= 600
+               for c in searched_candidates)
+    assert any(path.is_file() for path in (tmp_path / "out").rglob("final/images/**/*.jpg"))
+
+
+def test_x_photo_candidate_does_not_suppress_goods_search(tmp_path):
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    listing = "https://www.getchu.com/feature/"
+    searched = "https://www.getchu.com/soft.phtml?id=77"
+    image = "https://www.getchu.com/images/full.jpg"
+    x_photo = "https://www.getchu.com/images/x-photo.jpg"
+    x_status = "https://x.com/studio/status/123"
+    pages = {listing: (200, "<p>no product listing</p>"),
+             searched: (200, '<h1>School Days acrylic figure</h1><div class="gallery"><img src="/images/full.jpg" alt="School Days acrylic figure"></div>')}
+    search_calls = []
+    x_candidates = []
+
+    class XCandidateRunner(PipelineRunner):
+        async def _resolve_async(self, news, request):
+            return [SourceRef(url=listing, domain="getchu.com", source_type=SourceType.OFFICIAL_SITE),
+                    SourceRef(url=x_status, domain="x.com", source_type=SourceType.OFFICIAL_X)]
+
+        def _collect(self, news, source, *, request=None):
+            if source.url == x_status:
+                candidate = ImageCandidate(
+                    news_id=news.id, image_url=x_photo, source_url=x_status,
+                    source_type=SourceType.OFFICIAL_X, downloadable=True,
+                    fetched_at=datetime.now(timezone.utc), signals={"x_api_photo": True},
+                )
+                x_candidates.append(candidate)
+                return CollectionResult(candidates=[candidate])
+            return super()._collect(news, source, request=request)
+
+    resolver = DefaultSourceResolver(search_provider=lambda _news: search_calls.append(True) or [
+        SourceRef(url=searched, domain="getchu.com", source_type=SourceType.OFFICIAL_SITE)])
+    runner, requested = _runner(tmp_path, pages, [image, x_photo], [listing], parser=_Parser([x_status]), resolver=resolver)
+    runner.__class__ = XCandidateRunner
+    result = _run(tmp_path, runner, "x-photo")
+
+    assert result.status == "completed"
+    assert search_calls == [True]
+    assert searched in requested
+    assert any(c.source_url == searched and c.original_path for c in result.pipeline_result.candidates)
+    assert len(x_candidates) == 1
+    assert x_candidates[0].signals.get("x_api_photo") is True
+    assert x_candidates[0].download_status == "downloaded"
+    assert x_candidates[0].original_path and Path(x_candidates[0].original_path).is_file()
+
+
+def test_initial_goods_pages_exhaust_shared_budget_before_search_result_page(tmp_path):
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    urls = [f"https://www.getchu.com/feature/{index}" for index in range(20)]
+    pages = {url: (200, "<p>No related product content</p>") for url in urls}
+    search_calls = []
+    searched = "https://www.getchu.com/soft.phtml?id=77"
+    resolver = DefaultSourceResolver(search_provider=lambda _news: search_calls.append(True) or [
+        SourceRef(url=searched, domain="getchu.com", source_type=SourceType.OFFICIAL_SITE)])
+    runner, requested = _runner(tmp_path, pages, source_urls=urls, parser=_Parser(urls), resolver=resolver)
+    result = _run(tmp_path, runner, "shared-budget")
+
+    assert result.status == "completed"
+    assert search_calls == []
+    assert searched not in requested
+    assert any(failure.code == "goods_search_budget_exhausted" for failure in result.pipeline_result.failures)
 
 
 def _run(tmp_path, runner, issue="goods"):

@@ -318,6 +318,29 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
             emit("补充图片下载处理中…")
         if pending:
             await runtime.download(pending, attempt_root / "images", on_result=on_result)
+        if kind == "retry":
+            from .goods_collection import search_goods_after_download
+            emit("正在检查高清商品图并补搜来源…")
+            _, extra_results = await search_goods_after_download(runtime, news, sources, request, candidates)
+            by_id = {c.id: c for c in candidates}
+            additions = []
+            for collection in extra_results:
+                failures.extend(collection.failures)
+                for candidate in collection.candidates:
+                    if candidate.id in by_id or candidate.news_id != news_id:
+                        continue
+                    existing = prior.get(candidate.id)
+                    if existing and ImageDownloader.reusable(existing):
+                        candidate = existing.model_copy(deep=True)
+                    candidate.signals[provenance_key] = source_url
+                    candidate.signals[f"{kind}_attempt_id"] = attempt_id
+                    by_id[candidate.id] = candidate
+                    additions.append(candidate)
+            candidates = list(by_id.values())
+            save()
+            if additions:
+                emit(f"商品补搜新增 {len(additions)} 张候选，正在下载…")
+                await runtime.download(additions, attempt_root / "images", on_result=on_result)
         token.raise_if_cancelled()
         status = "completed"
     except (CancellationRequested, asyncio.CancelledError):
