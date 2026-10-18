@@ -32,6 +32,8 @@ REASONS = {
     "animated_source_requires_review": "动图代表帧需复核", "below_minimum_resolution": "原图尺寸未达到入选标准",
     "entity_conflict": "图片指向其他作品", "entity_unverified": "作品主体尚未确认",
     "duplicate_of_better_candidate": "同画面已有细节更好的版本",
+    "goods_reference_requires_manual_review": "商品参考图或原型图，需人工确认同款及阶段",
+    "goods_non_original_requires_manual_review": "仅取得商品预览图，未确认高清原图，保留待复核",
     "selected_by_rank_and_policy": "符合关联、类型及清晰度要求",
     "not_selected_by_policy_or_allocation": "未进入本条新闻的自动入选名额",
     "type_evidence_insufficient": "图片类型证据不足，保留待复核",

@@ -7,7 +7,7 @@ import pytest
 
 from galgame_news.domain import EventType, ImageNeed, NewsDraft
 from galgame_news.ingestion.analyzer import OpenAINewsAnalyzer, RuleBasedNewsAnalyzer, detect_image_need
-from galgame_news.ingestion.docx_parser import DocxDocumentParser
+from galgame_news.ingestion.docx_parser import DocxDocumentParser, split_urls
 
 
 def make_docx(path: Path, paragraphs: list[str]) -> None:
@@ -56,6 +56,43 @@ def test_docx_parser_keeps_all_news_sections_and_splits_concatenated_urls(tmp_pa
     assert issue.entries[0].title == "《Happy Weekend》主机板制作完成"
     assert issue.entries[0].source_urls == ["https://official.example/news", "https://x.com/studio/status/1"]
     assert issue.entries[1].title == "《Old Game》更新"
+
+
+def test_split_urls_preserves_nested_dmm_url_and_splits_adjacent_pastes():
+    dmm = "https://rcv.ixd.dmm.com/api/surl?urid=VRLXIjtX&lurl=https://www.dmm.co.jp/kuji/detail/schooldays/"
+    assert split_urls(f"{dmm} https://example.com/a") == [dmm, "https://example.com/a"]
+    assert split_urls("https://a.com/ahttps://b.com/b") == ["https://a.com/a", "https://b.com/b"]
+    assert split_urls("https://a.com/x\n说明后续内容") == ["https://a.com/x"]
+    assert split_urls("https://a.com/x，后续说明") == ["https://a.com/x"]
+
+
+def test_docx_parser_preserves_breaks_tabs_and_relationship_hyperlinks(tmp_path: Path):
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+    root = ET.Element(f"{{{w}}}document")
+    body = ET.SubElement(root, f"{{{w}}}body")
+    for text in ["作品#作者#"]:
+        p = ET.SubElement(body, f"{{{w}}}p")
+        run = ET.SubElement(p, f"{{{w}}}r")
+        ET.SubElement(run, f"{{{w}}}t").text = text
+    p = ET.SubElement(body, f"{{{w}}}p")
+    run = ET.SubElement(p, f"{{{w}}}r")
+    ET.SubElement(run, f"{{{w}}}t").text = "正文"
+    ET.SubElement(run, f"{{{w}}}br")
+    ET.SubElement(run, f"{{{w}}}tab")
+    link = ET.SubElement(p, f"{{{w}}}hyperlink", {f"{{{r}}}id": "rId1"})
+    linkrun = ET.SubElement(link, f"{{{w}}}r")
+    ET.SubElement(linkrun, f"{{{w}}}t").text = "点击查看"
+    source = tmp_path / "links.docx"
+    rels = ET.Element(f"{{{pkg}}}Relationships")
+    ET.SubElement(rels, f"{{{pkg}}}Relationship", {"Id": "rId1", "Type": "hyperlink", "Target": "https://example.com/news", "TargetMode": "External"})
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("word/document.xml", ET.tostring(root, encoding="unicode"))
+        archive.writestr("word/_rels/document.xml.rels", ET.tostring(rels, encoding="unicode"))
+    issue = DocxDocumentParser().parse(source, "259")
+    assert issue.entries[0].body == "正文\n\t点击查看"
+    assert issue.entries[0].source_urls == ["https://example.com/news"]
 
 
 def test_docx_parser_ignores_preamble_and_url_fragments_as_headings(tmp_path: Path):

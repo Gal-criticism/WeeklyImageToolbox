@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from galgame_news.pipeline.checkpoint import load_checkpoint
+
 import json
 from io import BytesIO
 from pathlib import Path
@@ -120,7 +122,7 @@ def test_pipeline_runner_cancellation_persists_checkpoint_and_resume_skips_compl
     cancelled = runner.run(request, stop_after_first, token)
     assert cancelled.status == "cancelled"
     assert cancelled.checkpoint_path.is_file()
-    checkpoint = json.loads(cancelled.checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint = load_checkpoint(cancelled.checkpoint_path).model_dump(mode="json")
     assert checkpoint["completed_news_ids"]
 
     resumed = runner.run(
@@ -380,11 +382,11 @@ def test_completed_resume_is_idempotent_and_preserves_published_files(tmp_path):
         CancellationToken(),
     )
     images = [
-        *initial.output_dir.joinpath("images").rglob("*.jpg"),
-        *initial.output_dir.joinpath("images").rglob("*.png"),
+        *initial.task_dir.joinpath("assets").rglob("*.jpg"),
+        *initial.task_dir.joinpath("assets").rglob("*.png"),
     ]
     assert images
-    before = {path.relative_to(initial.output_dir): path.read_bytes() for path in images}
+    before = {path.relative_to(initial.task_dir): path.read_bytes() for path in images}
 
     class ExplodingParser:
         def parse(self, path, issue_id):
@@ -404,10 +406,10 @@ def test_completed_resume_is_idempotent_and_preserves_published_files(tmp_path):
 
     assert resumed.status == "completed"
     resumed_images = [
-        *resumed.output_dir.joinpath("images").rglob("*.jpg"),
-        *resumed.output_dir.joinpath("images").rglob("*.png"),
+        *resumed.task_dir.joinpath("assets").rglob("*.jpg"),
+        *resumed.task_dir.joinpath("assets").rglob("*.png"),
     ]
-    assert {path.relative_to(resumed.output_dir): path.read_bytes() for path in resumed_images} == before
+    assert {path.relative_to(resumed.task_dir): path.read_bytes() for path in resumed_images} == before
     initial_originals = {path.relative_to(initial.output_dir): path.read_bytes() for path in (initial.output_dir / "originals").rglob("*") if path.is_file()}
     resumed_originals = {path.relative_to(resumed.output_dir): path.read_bytes() for path in (resumed.output_dir / "originals").rglob("*") if path.is_file()}
     assert resumed_originals == initial_originals
@@ -507,7 +509,7 @@ def test_request_config_path_changes_effective_configuration_hash(tmp_path):
         lambda event: None,
         CancellationToken(),
     )
-    checkpoint = json.loads(result.checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint = load_checkpoint(result.checkpoint_path).model_dump(mode="json")
 
     assert result.status == "completed"
     assert checkpoint["config_sha256"] != PipelineRunner(parser=parser, analyzer=analyzer, resolver=resolver)._config_hash()
@@ -524,7 +526,7 @@ def test_invalid_checkpoint_associations_fail_closed(tmp_path):
         lambda event: token.cancel() if event.kind == "news_completed" else None,
         token,
     )
-    checkpoint = json.loads(cancelled.checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint = load_checkpoint(cancelled.checkpoint_path).model_dump(mode="json")
     checkpoint["candidates"].append(
         {
             "news_id": "not-in-issue",
@@ -533,7 +535,8 @@ def test_invalid_checkpoint_associations_fail_closed(tmp_path):
             "fetched_at": "2026-01-01T00:00:00Z",
         }
     )
-    cancelled.checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    from galgame_news.tasks.repository import TaskRepository
+    TaskRepository(cancelled.task_dir).save_checkpoint(checkpoint)
 
     resumed = PipelineRunner(parser=parser, analyzer=analyzer, resolver=resolver).run(
         TaskRequest(
@@ -563,7 +566,7 @@ def test_cancellation_from_final_news_completed_stays_cancelled(tmp_path):
     )
 
     assert result.status == "cancelled"
-    assert json.loads(result.checkpoint_path.read_text(encoding="utf-8"))["status"] == "cancelled"
+    assert load_checkpoint(result.checkpoint_path).model_dump(mode="json")["status"] == "cancelled"
 
 
 def test_duplicate_failures_have_occurrence_count(tmp_path):
@@ -720,7 +723,7 @@ def test_terminal_event_sink_failure_is_in_result_and_checkpoint(tmp_path):
 
     assert result.status == "completed"
     assert any(failure.code == "event_sink_failed" for failure in result.failures)
-    checkpoint = json.loads(result.checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint = load_checkpoint(result.checkpoint_path).model_dump(mode="json")
     assert any(
         failure["code"] == "event_sink_failed"
         for failure in checkpoint["failures"]
@@ -835,7 +838,7 @@ def test_completion_event_sink_failure_is_returned_and_checkpointed(tmp_path, ev
 
     assert result.status == "completed"
     assert any(failure.code == "event_sink_failed" for failure in result.failures)
-    checkpoint = json.loads(result.checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint = load_checkpoint(result.checkpoint_path).model_dump(mode="json")
     assert any(failure["code"] == "event_sink_failed" for failure in checkpoint["failures"])
 
 

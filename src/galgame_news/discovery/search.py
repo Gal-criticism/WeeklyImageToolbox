@@ -9,9 +9,17 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from ..domain import DiscoveryMethod, NewsItem, SearchResult, SourceRef, SourceType
+from .goods_context import is_goods_news
 
 
 def _search_queries(news_item: NewsItem) -> tuple[str, ...]:
+    if is_goods_news(news_item):
+        # The product/event title is essential. A work-only query tends to
+        # return game screenshots instead of the announced merchandise.
+        terms = list(dict.fromkeys([*news_item.game_names, *news_item.organizations, news_item.title]))
+        base = " ".join(terms)[:240]
+        return (f"{base} 商品 site:eeo.today OR site:getchu.com OR site:amazon.co.jp OR site:gamers.co.jp",
+                f"{base} 商品 site:dmm.co.jp OR site:fantia.jp OR site:dlsite.com")
     base = " ".join(news_item.game_names or [news_item.title]).strip()
     text = " ".join((news_item.title, news_item.body, *news_item.keywords))
     if re.search(r"cg|ギャラリー|gallery|事件.?cg|画面公開|画像更新", text, re.I):

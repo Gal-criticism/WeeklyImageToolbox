@@ -387,9 +387,9 @@ def test_export_calls_existing_session_method_in_worker(qtbot, qapp, tmp_path, m
     original = session.export_final
     worker_thread = []
 
-    def export():
+    def export(**kwargs):
         worker_thread.append(QThread.currentThread() is not qapp.thread())
-        return original()
+        return original(**kwargs)
 
     monkeypatch.setattr(session, "export_final", export)
     page = ReviewPage()
@@ -408,7 +408,7 @@ def test_export_calls_existing_session_method_in_worker(qtbot, qapp, tmp_path, m
 def test_export_error_has_chinese_outcome_and_raw_error(qtbot, tmp_path, monkeypatch):
     session = session_at(tmp_path / "output", 1)
 
-    def fail():
+    def fail(**kwargs):
         raise OSError("disk error")
 
     monkeypatch.setattr(session, "export_final", fail)

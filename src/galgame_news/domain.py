@@ -194,6 +194,7 @@ class LocalizationProvenance(ContractModel):
     source_chain: list[str] = Field(default_factory=list)
 
 
+
 class NewsItem(ContractModel):
     id: str | None = None
     issue_id: str = Field(min_length=1)
@@ -243,6 +244,8 @@ class SourceRef(ContractModel):
     parent_url: str | None = None
     navigation_kind: str = ""
     navigation_text: str = ""
+    navigation_depth: int = Field(default=0, ge=0)
+    source_chain: list[str] = Field(default_factory=list)
 
 
 class ScoreBreakdown(ContractModel):
@@ -267,6 +270,14 @@ class ImageEvidence(ContractModel):
     method: str = "dom"
     relationship: str = "image attribute"
     variant_of: str | None = None
+    product_title: str = ""
+    seller: str = ""
+    work: str = ""
+    maker: str = ""
+    activity: str = ""
+    image_role: str = ""
+    stage: str = ""
+    source_chain: list[str] = Field(default_factory=list)
 
 
 class ImageCandidate(ContractModel):

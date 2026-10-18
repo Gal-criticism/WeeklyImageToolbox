@@ -25,6 +25,7 @@ from ..domain import FailureRecord, FailureStage, ImageCandidate, ImageCurationS
 from ..discovery.http import SafeHttpClient, UnsafeUrlError, ResponseTooLarge
 from ..discovery.adapters.common import _upgrade_image_url, _is_public_x_media
 from .validation import ImageValidator, meaningless_asset_reason, placeholder_asset_reason
+from ..tasks.assets import TaskAssets
 
 
 _EXTENSIONS = {
@@ -213,11 +214,25 @@ class ImageDownloader:
             if not validation.valid:
                 return candidate, self._failure(candidate, validation.reason or "invalid_image", "downloaded image failed validation", False), None
             suffix = _EXTENSIONS.get(validation.mime_type or "", ".img")
-            target = root / f"{candidate.id}{suffix}"
+            task_assets = TaskAssets.for_path(root)
+            if task_assets is not None:
+                from ..tasks.repository import TaskRepository
+                digest = hashlib.sha256(data).hexdigest()
+                # Durable intent bridges the crash window between landing the
+                # hash file and the coordinator committing download success.
+                TaskRepository(task_assets.root, create=False).prepare_asset(str(candidate.id), {
+                    "original_path": str(task_assets.original_path(data, suffix)),
+                    "original_sha256": digest, "original_mime_type": validation.mime_type,
+                    "original_width": validation.width, "original_height": validation.height,
+                    "original_byte_size": len(data), "downloaded_url": final_response_url,
+                })
+            target = task_assets.put_original(data, suffix) if task_assets else root / f"{candidate.id}{suffix}"
             if temporary is None:
-                temporary = root / f".{candidate.id}-{uuid.uuid4().hex}.part"
-                temporary.write_bytes(data)
-            os.replace(temporary, target)
+                if not task_assets:
+                    temporary = root / f".{candidate.id}-{uuid.uuid4().hex}.part"
+                    temporary.write_bytes(data)
+            if not task_assets:
+                os.replace(temporary, target)
             candidate.width, candidate.height = validation.width, validation.height
             candidate.mime_type, candidate.byte_size = validation.mime_type, len(data)
             candidate.sha256, candidate.perceptual_hash = hashlib.sha256(data).hexdigest(), _perceptual_hash(data)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from galgame_news.pipeline.checkpoint import load_checkpoint
+
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -125,7 +127,7 @@ def test_stop_during_async_download_leaves_no_partial_or_completed_news(tmp_path
         token.cancel()
         result = await asyncio.wait_for(task, 2)
         assert result.status == "cancelled"
-        assert json.loads(result.checkpoint_path.read_text(encoding="utf-8"))["completed_news_ids"] == []
+        assert load_checkpoint(result.checkpoint_path).model_dump(mode="json")["completed_news_ids"] == []
         assert not list(result.task_dir.rglob("*.part"))
     asyncio.run(run())
 

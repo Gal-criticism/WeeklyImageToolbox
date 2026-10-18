@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from ..domain import DiscoveryMethod, SourceType
 from .resolver import _normalize, _visit_key
 from .adapters.html import _explicit_age_confirmation_cookie
+from .goods_context import is_goods_news, unwrap_goods_url
 
 
 async def resolve_async(resolver, news, client, call_sync):
@@ -78,6 +79,15 @@ async def resolve_async(resolver, news, client, call_sync):
     historical = list(resolver.history_lookup(news))
     for source in historical:
         add(source.model_copy(update={"discovered_via": DiscoveryMethod.HISTORY}))
+    if is_goods_news(news):
+        for source in ordered:
+            target = unwrap_goods_url(source.url)
+            if target != source.url:
+                source.parent_url = source.url
+                source.url = target
+                source.domain = urlsplit(target).hostname or source.domain
+                source.source_chain = [source.root_url or source.parent_url, target]
+        return ordered
     for source in list(ordered):
         source_budget[0] = min(source_budget[0], 16 - sum(s.source_type is SourceType.OFFICIAL_SITE for s in ordered))
         for child in await crawl(source):

@@ -25,7 +25,11 @@ def test_new_evidence_and_media_state_survive_defensive_loading(tmp_path):
     data.update(evidence=[evidence, {"page_url":None}], download_status="downloaded", downloaded_url=data["image_url"], media_source_url=data["image_url"], expected_width=1280, expected_height=720)
     candidate, _ = ReviewSession._coerce_image(data)
     assert candidate is not None
-    assert [e.model_dump() for e in candidate.evidence] == [evidence]
+    assert len(candidate.evidence) == 1
+    restored = candidate.evidence[0].model_dump()
+    assert {key: restored[key] for key in evidence} == evidence
+    assert candidate.evidence[0].source_chain == []
+    assert candidate.evidence[0].product_title == ""
     assert candidate.download_status == "downloaded"
     assert candidate.media_source_url == data["image_url"]
 

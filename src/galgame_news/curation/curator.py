@@ -15,6 +15,7 @@ from .source_policy import SourceTrustPolicy
 from .visual_analysis import VisualAnalysisService, create_local_openclip_analyzer
 from ..delivery.helpers import section_prefix, section_label
 from ..localization.policy import LocalizationImagePolicy
+from ..discovery.goods_context import is_goods_news
 
 
 class ImageCurator:
@@ -180,6 +181,18 @@ class ImageCurator:
                     and source_linked
                     and not animated_source
                 )
+                goods_active = candidate.signals.get("goods_context") is True and item is not None and is_goods_news(item)
+                goods_role = str(candidate.signals.get("goods_role") or "").casefold()
+                goods_reference = candidate.signals.get("goods_reference") is True or goods_role == "reference"
+                if goods_active:
+                    if goods_reference:
+                        candidate.signals["auto_select"] = False
+                        candidate.selection_reasons.append("goods_reference_requires_manual_review")
+                    elif candidate.signals.get("goods_original") is False:
+                        candidate.signals["auto_select"] = False
+                        candidate.selection_reasons.append("goods_non_original_requires_manual_review")
+                    if (goods_reference or candidate.signals.get("goods_original") is False) and ReviewReason.IMAGE_TYPE_REVIEW not in candidate.review_reasons:
+                        candidate.review_reasons.append(ReviewReason.IMAGE_TYPE_REVIEW)
                 if not quality_eligible:
                     candidate.selection_reasons.append("below_minimum_resolution")
                     if ReviewReason.IMAGE_QUALITY_REVIEW not in candidate.review_reasons:
@@ -242,7 +255,7 @@ class ImageCurator:
                         (not source_result.is_official and match.confidence < 0.8)
                         or (
                             source_result.tier in {"official_brand_page", "official_store"}
-                            and not any(signal in match.supporting_signals for signal in ("entity_name_in_context", "page_context", "steam_app_id_match", "explicit_entity_signal", "official_news_linked_goods"))
+                            and not any(signal in match.supporting_signals for signal in ("entity_name_in_context", "page_context", "steam_app_id_match", "explicit_entity_signal", "official_news_linked_goods", "goods_item_match"))
                         )
                     ):
                         candidate.signals["auto_select"] = False
@@ -310,8 +323,23 @@ class ImageCurator:
         for candidate in all_deduped.duplicates:
             if candidate not in deduped.duplicates and candidate.signals.get("duplicate_of"):
                 candidate.selected = False
+        def goods_rank(candidate):
+            item = by_news.get(candidate.news_id)
+            if not (candidate.signals.get("goods_context") is True and item is not None and is_goods_news(item)
+                    and candidate.signals.get("goods_association") == "matched"):
+                return 3
+            role = str(candidate.signals.get("goods_role") or "").casefold()
+            if role in {"main", "design", "bonus", "cover", "sample"}:
+                return 0
+            if role == "collection":
+                return 1
+            if candidate.signals.get("goods_reference") is True or role == "reference":
+                return 2
+            return 3
+
         ranked = sorted(deduped.unique, key=lambda c: (
             not (c.signals.get("x_api_photo") is True or c.signals.get("socialdata_photo") is True),
+            goods_rank(c),
             -int(c.signals.get("localization_rank_priority", 0)),
             -(c.score.total if c.score else 0.0),
             -(c.score.source_trust if c.score else 0.0),

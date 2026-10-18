@@ -34,8 +34,16 @@ class DownloadJournal:
         self.identity = {"input_sha256": input_hash, "config_sha256": config_hash}
         self.last_save_recovered = False
         self._locked_until = {}
+        from ..tasks.repository import TaskRepository
+        self.repository = TaskRepository(self.root, create=False) if TaskRepository.is_authoritative(self.root) else None
 
     def save(self, news_id, candidates):
+        if self.repository is not None:
+            if news_id not in self.news_ids:
+                raise ValueError("download journal news id is unknown")
+            self.repository.save_journal(news_id, [value.model_dump(mode="json") for value in candidates if value.news_id == news_id], self.identity)
+            self.last_save_recovered = False
+            return
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / (hashlib.sha256(news_id.encode()).hexdigest()[:20] + ".json")
         payload = {**self.identity, "news_id": news_id, "journal_revision": time.time_ns(),
@@ -65,6 +73,15 @@ class DownloadJournal:
                     pass  # An occupied older snapshot is safe to leave behind.
 
     def load(self):
+        if self.repository is not None:
+            self.repository.recover_asset_intents()
+            rows, collected = self.repository.load_journal(self.identity)
+            # Review supplement operations can cover only one news in the
+            # same task. Never merge candidates from other news into that run.
+            values = [ImageCandidate.model_validate(row) for row in rows if row.get("news_id") in self.news_ids]
+            for candidate in values:
+                self.confine(candidate)
+            return values, set(collected) & self.news_ids
         values = []
         collected = set()
         latest = {}
@@ -115,12 +132,18 @@ class DownloadJournal:
     def save_post(self, post_id, state, payload=None):
         if not post_id.isdecimal():
             raise ValueError("invalid post id")
+        if self.repository is not None:
+            self.repository.save_post(post_id, state, public_media_payload(payload) if payload is not None else None, self.identity)
+            return
         directory = self.root / "x_media_cache"
         directory.mkdir(parents=True, exist_ok=True)
         atomic_json_write(directory/(post_id+".json"), {**self.identity, "state":state,
             "payload":public_media_payload(payload) if payload is not None else None})
 
     def load_posts(self):
+        if self.repository is not None:
+            return {key: value["payload"] if value["state"] == "success" else None
+                    for key, value in self.repository.load_posts(self.identity).items()}
         result = {}
         for path in (self.root/"x_media_cache").glob("*.json"):
             if not path.stem.isdecimal():

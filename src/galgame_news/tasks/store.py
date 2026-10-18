@@ -90,6 +90,9 @@ class TaskRecord:
 
     @property
     def images_only(self) -> bool:
+        from .repository import TaskRepository
+        if TaskRepository.is_authoritative(self.root_path):
+            return False
         root = self.root_path
         return (not self.imported and (root / "final" / "images").is_dir()
                 and not (root / "raw" / "image_index.json").is_file()
@@ -394,6 +397,26 @@ class TaskStore:
         rows = self._connection.execute("SELECT * FROM tasks WHERE active = 0 ORDER BY created_at DESC, task_id DESC").fetchall()
         return [record for row in rows if (record := self._row_to_record(row)) is not None]
 
+    def storage_root(self, task: TaskRecord | str) -> Path:
+        """Return the authoritative task root for imported SQLite output.
+
+        Imported legacy output keeps using its private catalog stub. Imported
+        output that points into a SQLite task uses that source task for durable
+        options and retry batches, without changing the imported record itself.
+        """
+        record = task if isinstance(task, TaskRecord) else self.get_task(str(task))
+        if record is None:
+            raise ValueError("unknown task")
+        if record.imported and record.source_output_path is not None:
+            from .repository import TaskRepository
+            source = record.source_output_path.expanduser().resolve()
+            if source.is_file():
+                source = source.parent
+            for parent in (source, *source.parents):
+                if TaskRepository.is_authoritative(parent):
+                    return parent
+        return record.root_path
+
     def history(self) -> list[TaskRecord]:
         return self.list_history()
 
@@ -450,7 +473,12 @@ class TaskStore:
         record = task if isinstance(task, TaskRecord) else self.get_task(str(task))
         if record is None:
             raise ValueError("unknown task")
-        path = record.root_path / "request_options.json"
+        root = self.storage_root(record)
+        from .repository import TaskRepository
+        if TaskRepository.is_authoritative(root):
+            TaskRepository(root, create=False).save_options(options)
+            return
+        path = root / "request_options.json"
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         temporary.write_text(
             json.dumps(options, ensure_ascii=False, indent=2, sort_keys=True),
@@ -464,7 +492,11 @@ class TaskStore:
         record = task if isinstance(task, TaskRecord) else self.get_task(str(task))
         if record is None:
             return {}
-        value = _read_json(record.root_path / "request_options.json", {})
+        root = self.storage_root(record)
+        from .repository import TaskRepository
+        if TaskRepository.is_authoritative(root):
+            return TaskRepository(root, create=False).load_options()
+        value = _read_json(root / "request_options.json", {})
         return value if isinstance(value, dict) else {}
 
     def remove_from_history(self, task_id: str) -> bool:
@@ -508,9 +540,17 @@ class TaskStore:
             raise KeyError(f"unknown task: {task}")
         news_id = self._valid_retry_component(news_id, "news id")
         attempt_id = self._valid_retry_component(attempt_id, "attempt id")
-        retries = Path(record.task_root) / "retries"
+        storage_root = self.storage_root(record)
+        retries = storage_root / "retries"
         attempt = self._confined(Path(path) if path is not None else retries / news_id / attempt_id, retries)
-        state_path = Path(record.state_path or Path(record.task_root) / "task_state.sqlite3")
+        state_path = Path(record.state_path or record.root_path / "task_state.sqlite3")
+        from .repository import TaskRepository
+        if TaskRepository.is_authoritative(storage_root):
+            # The collector transaction already registers SQLite batches.
+            # Keep their relative paths rather than rewriting them on the GUI.
+            if TaskRepository(storage_root, create=False).read_batch(news_id, attempt_id) is None:
+                raise ValueError("补抓批次尚未保存至任务数据库")
+            return attempt
         self._ensure_task_state_schema(state_path)
         with sqlite3.connect(state_path, timeout=0.1) as connection:
             connection.execute(
@@ -563,6 +603,35 @@ class TaskStore:
         record = task if isinstance(task, TaskRecord) else self.get_task(str(task))
         if record is None:
             raise KeyError(f"unknown task: {task}")
+        from .repository import TaskRepository
+        storage_root = self.storage_root(record)
+        if TaskRepository.is_authoritative(storage_root):
+            batches = TaskRepository(storage_root, create=False).list_batches()
+            result = []
+            for batch in batches:
+                try:
+                    news_id = self._valid_retry_component(batch["news_id"], "news id")
+                    attempt_id = self._valid_retry_component(batch["attempt_id"], "attempt id")
+                    attempt = self._confined(Path(batch["path"]), storage_root / "retries")
+                    if attempt != (storage_root / "retries" / news_id / attempt_id).resolve():
+                        raise ValueError("retry batch path does not match its catalog ids")
+                    result.append(RetryAttempt(record.task_id, news_id, attempt_id, attempt,
+                        batch["images"], batch["videos"], batch["failures"], batch["kind"]))
+                except (ValueError, OSError, TypeError) as exc:
+                    self.retry_diagnostics.append(diagnose_error(exc, "retry_list", candidate_id=str(batch.get("attempt_id", ""))))
+            if record.imported and record.root_path.resolve() != storage_root.resolve():
+                source_diagnostics = list(self.retry_diagnostics)
+                legacy = TaskRecord(record.task_id, record.issue_id, record.task_root,
+                    record.input_path, None, record.input_sha256, record.state_path,
+                    False, record.created_at, record.active)
+                result.extend(self.list_retry_attempts(legacy))
+                diagnostics = list(self.retry_diagnostics)
+                self.retry_diagnostics = source_diagnostics + diagnostics
+            deduplicated = {}
+            for attempt in result:
+                deduplicated.setdefault((attempt.news_id, attempt.attempt_id), attempt)
+            return list(deduplicated.values())
+            return result
         state_path = Path(record.state_path or Path(record.task_root) / "task_state.sqlite3")
         self._ensure_task_state_schema(state_path)
         # A run can be interrupted after publishing its manifest but before the

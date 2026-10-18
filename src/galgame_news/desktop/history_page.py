@@ -17,6 +17,7 @@ class HistoryPage(QWidget):
     resume_requested = Signal(object)
     review_requested = Signal(object)
     open_requested = Signal(object)
+    migration_requested = Signal(object)
 
     def __init__(self, store: TaskStore | None = None, parent: QWidget | None = None):
         super().__init__(parent)
@@ -24,6 +25,8 @@ class HistoryPage(QWidget):
         self.store = store or TaskStore()
         self.records: list[TaskRecord] = []
         self._visible_records: list[TaskRecord] = []
+        self._migration_busy = False
+        self._migration_blocked = False
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("按期号搜索历史任务")
         self.search_edit.textChanged.connect(self._filter)
@@ -36,13 +39,17 @@ class HistoryPage(QWidget):
         self.review_button.setProperty("primary", True)
         self.open_button = QPushButton("打开目录")
         self.remove_button = QPushButton("移出历史")
+        self.migrate_button = QPushButton("迁移任务存储")
+        self.migration_status = QLabel("")
+        self.migration_status.setObjectName("muted")
         self.remove_button.setToolTip("仅移出列表，原有任务文件保留")
         self.resume_button.clicked.connect(self.resume_selected)
         self.review_button.clicked.connect(self.review_selected)
         self.open_button.clicked.connect(self.open_selected)
         self.remove_button.clicked.connect(self.remove_selected)
+        self.migrate_button.clicked.connect(self.migrate_selected)
         actions = QHBoxLayout()
-        for button in (self.resume_button, self.review_button, self.open_button, self.remove_button):
+        for button in (self.resume_button, self.review_button, self.open_button, self.remove_button, self.migrate_button):
             actions.addWidget(button)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 12, 8, 12)
@@ -52,6 +59,7 @@ class HistoryPage(QWidget):
         layout.addWidget(self.empty_label)
         layout.addWidget(self.task_list)
         layout.addLayout(actions)
+        layout.addWidget(self.migration_status)
         self.task_list.currentRowChanged.connect(self._update_actions)
         self.refresh()
 
@@ -85,6 +93,7 @@ class HistoryPage(QWidget):
         selected = self.selected_record()
         for button in (self.review_button, self.open_button, self.remove_button):
             button.setEnabled(selected is not None)
+        self.migrate_button.setEnabled(selected is not None and not self._migration_busy and not self._migration_blocked)
         compact = selected is not None and selected.images_only
         self.resume_button.setEnabled(selected is not None and not selected.imported and not compact)
         self.review_button.setText("打开图片" if compact else "查看图片")
@@ -132,6 +141,30 @@ class HistoryPage(QWidget):
         if removed:
             self.refresh()
         return removed
+
+    def migrate_selected(self) -> None:
+        record = self.selected_record()
+        if record is not None:
+            self.migration_requested.emit(record)
+
+    def set_migration_busy(self, busy: bool) -> None:
+        busy = bool(busy)
+        self._migration_busy = busy
+        self.search_edit.setEnabled(not busy)
+        self.task_list.setEnabled(not busy)
+        for button in (self.resume_button, self.review_button, self.open_button, self.remove_button):
+            if busy:
+                button.setEnabled(False)
+        self.migrate_button.setEnabled(not busy and self.selected_record() is not None and not self._migration_blocked)
+        if not busy:
+            self._update_actions()
+
+    def set_migration_blocked(self, blocked: bool) -> None:
+        self._migration_blocked = bool(blocked)
+        self._update_actions()
+
+    def show_migration_report(self, message: str) -> None:
+        self.migration_status.setText(message)
 
 
 __all__ = ["HistoryPage"]

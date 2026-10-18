@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from ..config import ImageTypeConfig
 from ..domain import EventType, ImageCandidate, ImageEvidence, ImageNeed, ImageType, NewsItem
+from ..discovery.goods_context import is_goods_news
 
 
 @dataclass(frozen=True)
@@ -267,6 +268,18 @@ class ImageTypeClassifier:
         news_text = _news_text(news)
         aspect = _aspect(candidate)
         linked_news_gallery = _official_news_linked_gallery(news, candidate)
+
+        # Service-verified GOODS item roles are local item evidence. Keep this
+        # ahead of filename/gallery heuristics so covers and ASMR jackets can
+        # never be promoted to game CG by a broad page context.
+        if candidate.signals.get("goods_context") is True and is_goods_news(news):
+            item_id = candidate.signals.get("goods_item_id")
+            from ..discovery.goods_context import has_item_evidence
+            goods_evidence = has_item_evidence(candidate)
+            explicit_priority_roles = {ImageType.LOGO, ImageType.DECORATIVE, ImageType.CHARACTER_ART}
+            explicit_local_roles = {role for _, role in _local_role_evidence(candidate)}
+            if goods_evidence and not (explicit_priority_roles & explicit_local_roles):
+                return self._result(ImageType.GOODS, 0.96, ("goods_item_evidence",))
 
         # Explicit UI assets must win even when they come from an official page.
         if _has_term(local_text, "steam_share_image"):

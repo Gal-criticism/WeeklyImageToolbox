@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt, QEvent
+from collections.abc import Callable
+
+from PySide6.QtCore import Qt, QEvent
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QVBoxLayout,
@@ -14,6 +16,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QWidget,
     QApplication,
+    QMessageBox,
 )
 
 from .controller import DesktopController
@@ -24,7 +27,13 @@ from .resources import CharacterArt, configure_branding
 class MainWindow(QMainWindow):
     PAGE_NAMES = ("新建任务", "抓取进度", "图片审核", "历史任务", "设置")
 
-    def __init__(self, controller: DesktopController | None = None, parent: QWidget | None = None):
+    def __init__(
+        self,
+        controller: DesktopController | None = None,
+        parent: QWidget | None = None,
+        *,
+        exit_handler: Callable[[], object] | None = None,
+    ):
         super().__init__(parent)
         self.setObjectName("mainWindow")
         self.setWindowTitle("周报图片采集工具箱")
@@ -32,6 +41,7 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
         self.setMinimumSize(1100, 720)
         self.controller = controller or DesktopController(parent=self)
+        self._exit_handler = exit_handler
         self.navigation = QListWidget()
         self.navigation.setObjectName("navigation")
         self.nav_list = self.navigation
@@ -45,11 +55,8 @@ class MainWindow(QMainWindow):
         self.review_page = self.controller.review_page
         self.history_page = self.controller.history_page
         self.settings_page = self.controller.settings_page
-        self._close_pending = False
-        self._close_signals_connected = False
-        self._close_timer = QTimer(self)
-        self._close_timer.setInterval(30)
-        self._close_timer.timeout.connect(self._finish_deferred_close)
+        self._exit_committed = False
+        self._force_close_prompt_open = False
         for page in (self.new_task_page, self.progress_page, self.review_page, self.history_page, self.settings_page):
             self.pages.addWidget(page)
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
@@ -89,34 +96,42 @@ class MainWindow(QMainWindow):
                 if (item := self.navigation.item(index)) is not None:
                     item.setIcon(icon(symbol))
 
-    def _connect_deferred_close(self) -> None:
-        if self._close_signals_connected:
-            return
-        self._close_signals_connected = True
-        for signal in (self.controller.task_finished, self.controller.task_cancelled, self.controller.task_failed, self.controller.history_changed, self.controller.work_changed):
-            signal.connect(self._schedule_deferred_close)
-
-    def _schedule_deferred_close(self, *_args) -> None:
-        if self._close_pending:
-            QTimer.singleShot(0, self._finish_deferred_close)
-
-    def _finish_deferred_close(self) -> None:
-        if self._close_pending and self.controller.close(timeout_ms=0):
-            self._close_timer.stop()
-            self._close_pending = False
-            self.close()
+    def _confirm_force_close(self) -> bool:
+        dialog = QMessageBox(QMessageBox.Icon.Warning, "退出确认", "任务正在进行，退出将中断任务，尚未保存的审核改动可能丢失。是否退出？", self)
+        exit_button = dialog.addButton("退出", QMessageBox.ButtonRole.AcceptRole)
+        cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(cancel_button)
+        dialog.exec()
+        return dialog.clickedButton() is exit_button
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
-        if self._close_pending:
+        if self._exit_committed:
+            event.accept()
+            self.hide()
+            return
+        if self._force_close_prompt_open:
             event.ignore()
             return
-        if self.controller.close(timeout_ms=0):
+        if self.controller.has_active_operations:
+            self._force_close_prompt_open = True
+            try:
+                if not self._confirm_force_close():
+                    event.ignore()
+                    return
+            finally:
+                self._force_close_prompt_open = False
+
+        try:
+            self.controller.begin_force_close()
+        except Exception:
+            # A cleanup error must not leave the application window stuck open.
+            pass
+        finally:
+            self._exit_committed = True
             event.accept()
-        else:
-            self._close_pending = True
-            self._connect_deferred_close()
-            self._close_timer.start()
-            event.ignore()
+            self.hide()
+            if self._exit_handler is not None:
+                self._exit_handler()
 
 
 __all__ = ["MainWindow"]

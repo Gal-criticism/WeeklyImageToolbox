@@ -70,9 +70,10 @@ def resolve_task_paths(request, *, legacy_output: bool = False) -> TaskPaths:
         if not within(task_dir, output_root):
             raise ValueError("task_dir escapes output root")
         raw_dir = task_dir / "raw"
-        checkpoint = task_dir / "checkpoint.json"
-        if request.checkpoint_path is not None and Path(request.checkpoint_path).resolve() != checkpoint:
-            raise ValueError("checkpoint_path must be task_dir/checkpoint.json")
+        from ..tasks.repository import TaskRepository
+        checkpoint = task_dir / ("task_state.sqlite3" if TaskRepository.is_authoritative(task_dir) else "checkpoint.json")
+        if request.checkpoint_path is not None and Path(request.checkpoint_path).resolve() not in {checkpoint, task_dir / "checkpoint.json"}:
+            raise ValueError("checkpoint_path must belong to this task")
         return TaskPaths(
             task_dir=task_dir,
             raw_dir=raw_dir,
@@ -86,7 +87,7 @@ def resolve_task_paths(request, *, legacy_output: bool = False) -> TaskPaths:
     return TaskPaths(
         task_dir=task_dir,
         raw_dir=task_dir / "raw",
-        checkpoint_path=task_dir / "checkpoint.json",
+        checkpoint_path=task_dir / "task_state.sqlite3",
         task_id=request.task_id or task_dir.name,
     )
 

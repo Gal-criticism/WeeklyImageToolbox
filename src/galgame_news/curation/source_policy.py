@@ -37,6 +37,18 @@ class SourceTrustPolicy:
     def classify(self, candidate: ImageCandidate) -> SourceTrustResult:
         host = self._host(candidate.source_url)
         image_host = self._host(candidate.image_url)
+        if candidate.signals.get("goods_context") is True:
+            role = str(candidate.signals.get("goods_role") or "").casefold()
+            reference = candidate.signals.get("goods_reference") is True or role == "reference"
+            from ..discovery.goods_context import has_item_evidence
+            evidence = has_item_evidence(candidate)
+            association_ok = candidate.signals.get("goods_association") == "matched" and evidence
+            merchant_sites = {"eeo", "getchu", "amazon_jp", "gamers", "dmm", "fantia", "dlsite"}
+            merchant = candidate.signals.get("goods_site") in merchant_sites
+            if reference:
+                return SourceTrustResult("third_party_news", 0.4, False, True)
+            if merchant and association_ok:
+                return SourceTrustResult("official_store", 0.86, True)
         if candidate.source_type is SourceType.OFFICIAL_X:
             return SourceTrustResult("official_event_page", 0.88, True)
         if candidate.source_type is SourceType.STEAM:

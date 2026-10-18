@@ -60,8 +60,14 @@ def _read(path, default):
 
 def _news(root, issue_id, news_id, news_item, *, strict_checkpoint=False):
     checkpoint_path = root / "checkpoint.json"
+    from ..tasks.repository import TaskRepository
+    if TaskRepository.is_authoritative(root):
+        checkpoint_path = root / "task_state.sqlite3"
     if strict_checkpoint:
-        if checkpoint_path.is_file():
+        has_checkpoint = checkpoint_path.is_file()
+        if checkpoint_path.suffix == ".sqlite3" and has_checkpoint:
+            has_checkpoint = TaskRepository(root, create=False).load_checkpoint() is not None
+        if has_checkpoint:
             # Present checkpoints are critical task state and must validate.
             from .checkpoint import load_checkpoint
             checked = load_checkpoint(checkpoint_path)
@@ -71,7 +77,12 @@ def _news(root, issue_id, news_id, news_item, *, strict_checkpoint=False):
             # NewsItem supplied by the caller; never synthesize display data.
             checkpoint = {}
     else:
-        checkpoint = _read(checkpoint_path, {})
+        if checkpoint_path.suffix == ".sqlite3":
+            from .checkpoint import load_checkpoint
+            payload = TaskRepository(root, create=False).load_checkpoint()
+            checkpoint = load_checkpoint(checkpoint_path).model_dump(mode="json") if payload is not None else {}
+        else:
+            checkpoint = _read(checkpoint_path, {})
     if checkpoint and checkpoint.get("issue_id") != issue_id:
         raise ValueError("补抓任务期号与检查点不一致")
     data = next((n for n in checkpoint.get("issue", {}).get("news_items", []) if n.get("id") == news_id), None)
@@ -105,6 +116,15 @@ def _prior_candidates(root, news_id, source_url, kind):
     """Reuse only indexed assets belonging to this task and this news."""
     records = []
     diagnostics = []
+    from ..tasks.repository import TaskRepository
+    if TaskRepository.is_authoritative(root):
+        repository = TaskRepository(root, create=False)
+        rows = list(repository.iter_candidates(news_id=news_id))
+        prior_sources = None
+        for batch in repository.list_batches(news_id=news_id):
+            if batch.get("kind") == kind and batch.get("source_url") == source_url:
+                prior_sources = [SourceRef.model_validate(value) for value in batch.get("sources", [])]
+        return {row["id"]: ImageCandidate.model_validate(row) for row in rows}, prior_sources, diagnostics
     raw_index = root / "raw" / "image_index.json"
     payload = _read(raw_index, {})
     if not isinstance(payload, dict) or not isinstance(payload.get("candidates", []), list):
@@ -212,6 +232,12 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
                                                      "candidate_count": len(candidates)}))
 
     def save():
+        from ..tasks.repository import TaskRepository
+        if TaskRepository.is_authoritative(root):
+            TaskRepository(root, create=False).save_batch(news_id, attempt_id, str(attempt_root), kind, status,
+                [c.model_dump(mode="json") for c in candidates], [], [f.model_dump(mode="json") for f in failures],
+                source_url, [s.model_dump(mode="json") for s in sources])
+            return
         atomic_json_write(attempt_root / "image_index.json", {
             "schema_version": 1, "kind": kind, "source_url": source_url,
             "status": status, "issue_id": issue_id,

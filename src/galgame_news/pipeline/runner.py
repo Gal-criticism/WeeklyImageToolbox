@@ -232,6 +232,17 @@ class PipelineRunner:
                 from .compact_output import recover_interrupted_compaction
                 recover_interrupted_compaction(task_dir, task_id=task_id)
             self._prepare_task_dir(task_dir, request)
+            if not self._legacy_output and not resumed:
+                from ..tasks.repository import TaskRepository
+                repository = TaskRepository(task_dir)
+                repository.activate()
+                repository.save_options({
+                    key: str(value) if isinstance(value, Path) else value
+                    for key, value in vars(request).items()
+                } if hasattr(request, "__dict__") else {
+                    key: str(getattr(request, key)) if isinstance(getattr(request, key), Path) else getattr(request, key)
+                    for key in request.__dataclass_fields__
+                })
             self._emit(sink, failures, self._event("task_workspace_ready", task_id, request.issue_id,
                 payload={"task_dir": str(task_dir)}, message="任务目录已建立"))
             if resumed:
@@ -257,6 +268,14 @@ class PipelineRunner:
                         candidate.download_status = "downloaded"
                 repair_news = {candidate.news_id for candidate in candidates if journal.needs_download(candidate, failures)}
                 media_only_news = collected_ids | {candidate.news_id for candidate in candidates}
+                repair_video_news = set()
+                if not request.offline and not request.no_videos and config.video.enabled:
+                    for video in videos:
+                        if self._video_needs_recovery(video, failures, task_dir):
+                            repair_video_news.add(video.news_id)
+                            self._reset_video_for_recovery(video)
+                    repair_news.update(repair_video_news)
+                    media_only_news.update(repair_video_news)
                 completed.difference_update(repair_news)
                 missing_media_news = {value.news_id for value in failures if value.code == "download_failed" and value.news_id not in media_only_news}
                 for news_id in missing_media_news:
@@ -266,7 +285,7 @@ class PipelineRunner:
                     if checkpoint.result is None:
                         raise ValueError("completed checkpoint has no result")
                     self._emit(sink, failures, self._event("x_media_stats", task_id, issue.issue_id, payload=self._x_media_payload(candidates)))
-                    if not self._legacy_output and (raw_dir / "image_index.json").is_file():
+                    if not self._legacy_output and raw_dir.is_dir():
                         await self._network_runtime.call_sync(lambda: self._export_review_delivery(raw_dir, task_dir))
                     return TaskResult(
                         status="completed", task_id=task_id, task_dir=task_dir,
@@ -471,6 +490,9 @@ class PipelineRunner:
                 if news.id in media_only_news:
                     news_sources = source_map.get(news.id, [])
                     news_candidates = [candidate for candidate in candidates if candidate.news_id == news.id]
+                    if news.id in repair_video_news:
+                        news_videos = [video for video in videos if video.news_id == news.id
+                                       and self._video_needs_recovery(video, failures, task_dir)]
                     for candidate in news_candidates:
                         if journal.needs_download(candidate, failures) and candidate.download_status != "permanent_failed":
                             candidate.download_status = "pending"
@@ -599,10 +621,21 @@ class PipelineRunner:
                             videos.extend(news_videos)
                         elif news_videos:
                             await token.wait_if_paused_async()
-                            downloaded, video_failures = await self._network_runtime.call_sync(
-                                lambda: self._download_videos(news_videos, self._video_stage(task_dir)),
+                            prior_successes = sum(
+                                video.news_id == news.id and self._video_asset_is_valid(video, task_dir)
+                                for video in videos if video.id not in {value.id for value in news_videos}
                             )
+                            remaining_video_slots = max(0, self.config.video.max_per_news - prior_successes)
+                            downloaded, video_failures = await self._network_runtime.call_sync(
+                                lambda: self._download_videos(news_videos, self._video_stage(task_dir),
+                                                              max_per_news=remaining_video_slots),
+                            )
+                            attempted_ids = {video.id for video in news_videos}
+                            videos = [video for video in videos if video.id not in attempted_ids]
                             videos.extend(downloaded)
+                            failures = [failure for failure in failures if not (
+                                failure.stage is FailureStage.DOWNLOAD and failure.candidate_id in attempted_ids
+                            )]
                             failures.extend(video_failures)
                             await token.wait_if_paused_async()
                     videos = self._dedupe_videos([*videos, *news_videos])
@@ -712,7 +745,7 @@ class PipelineRunner:
                 raise RuntimeError("已下载图片未进入发布索引，保留暂存文件")
             for value in result.all_candidates:
                 if value.download_status == "downloaded" and (
-                    not value.original_path or not Path(value.original_path).resolve().is_relative_to(raw_dir.resolve())
+                    not value.original_path or not Path(value.original_path).resolve().is_relative_to(task_dir.resolve())
                     or not ImageDownloader.reusable(value)
                 ):
                     raise RuntimeError("已下载原件未正确发布，保留暂存文件")
@@ -798,6 +831,13 @@ class PipelineRunner:
             self.resolver = self._make_resolver(config)
 
     def _collect(self, news, source, *, request=None):
+        if self.adapter_factory is None:
+            from ..discovery.goods_service import GoodsSourceService
+            if GoodsSourceService.supports(news, source):
+                return GoodsSourceService(self._page_client()).collect(news, source, CollectionContext(
+                    timeout_seconds=self.config.network.timeout_seconds,
+                    max_candidates=self.config.search.max_candidates_per_source,
+                    now=datetime.now(timezone.utc)))
         # Explicit review additions can reuse the work-aware adapters in any
         # section; ordinary x/z collection retains its existing behavior.
         host = (urlsplit(source.url).hostname or "").casefold()
@@ -886,17 +926,20 @@ class PipelineRunner:
         from ..discovery.http import SafeHttpClient
         return SafeHttpClient(transport=self.source_transport, timeout=20.0, max_retries=2)
 
-    def _download_videos(self, candidates, output_dir):
+    def _download_videos(self, candidates, output_dir, *, max_per_news=None):
+        video_config = self.config.video
+        if max_per_news is not None:
+            video_config = video_config.model_copy(update={"max_per_news": max_per_news})
         if self.video_downloader_factory is None:
             from ..video import VideoDownloader
-            downloader = VideoDownloader(self.config.video, ffmpeg_detector=self.video_ffmpeg_detector)
+            downloader = VideoDownloader(video_config, ffmpeg_detector=self.video_ffmpeg_detector)
         else:
             try:
                 downloader = self.video_downloader_factory(
-                    self.config.video, ffmpeg_detector=self.video_ffmpeg_detector,
+                    video_config, ffmpeg_detector=self.video_ffmpeg_detector,
                 )
             except TypeError:
-                downloader = self.video_downloader_factory(self.config.video)
+                downloader = self.video_downloader_factory(video_config)
         return downloader.download(candidates, output_dir)
 
     def _curate_result(self, issue, candidates, failures, videos, source_map, max_images):
@@ -969,6 +1012,16 @@ class PipelineRunner:
             raise
         if backup.exists():
             shutil.rmtree(backup, ignore_errors=True)
+        from ..tasks.repository import TaskRepository
+        if TaskRepository.is_authoritative(task_dir):
+            # JSON is a publication snapshot only. Commit converted assets
+            # before review/export reads the authoritative database.
+            def snapshot(name, default):
+                path = raw_dir / name
+                return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else default
+            TaskRepository(task_dir, create=False).save_index(
+                snapshot("image_index.json", {}), snapshot("video_index.json", {}),
+                snapshot("review_required.json", []), snapshot("failed_items.json", []))
         self._export_review_delivery(raw_dir, task_dir)
         return manifest
 
@@ -1164,6 +1217,42 @@ class PipelineRunner:
         for video in videos or []:
             unique.setdefault(video.id or video.video_url, video)
         return list(unique.values())
+
+    @classmethod
+    def _video_asset_is_valid(cls, video, task_dir):
+        if video.status is not VideoStatus.DOWNLOADED or not video.local_path or not video.sha256:
+            return False
+        path = Path(video.local_path)
+        try:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(Path(task_dir).resolve()) or not resolved.is_file():
+                return False
+            digest = checkpoint_io.sha256_path(resolved)
+        except OSError:
+            return False
+        return digest.casefold() == str(video.sha256).casefold()
+
+    @classmethod
+    def _video_needs_recovery(cls, video, failures, task_dir):
+        if cls._video_asset_is_valid(video, task_dir):
+            return False
+        if video.status in {VideoStatus.DISCOVERED, VideoStatus.DOWNLOADING}:
+            return True
+        if video.status is VideoStatus.FAILED:
+            return any(failure.stage is FailureStage.DOWNLOAD
+                       and failure.candidate_id == video.id and failure.retryable
+                       for failure in failures)
+        if video.status is VideoStatus.SKIPPED:
+            return video.failure_reason in {"height_exceeded", "file_size_exceeded"}
+        return video.status is VideoStatus.DOWNLOADED
+
+    @staticmethod
+    def _reset_video_for_recovery(video):
+        if video.status is VideoStatus.DOWNLOADED:
+            video.local_path = None
+            video.sha256 = None
+        video.status = VideoStatus.DISCOVERED
+        video.failure_reason = None
 
     @staticmethod
     def _merge_failures(failures):

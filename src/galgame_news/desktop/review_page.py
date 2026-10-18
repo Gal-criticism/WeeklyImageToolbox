@@ -8,7 +8,7 @@ from PySide6.QtCore import QElapsedTimer, QEvent, QPoint, QSize, QTimer, QUrl, Q
 from PySide6.QtGui import QDesktopServices, QIcon, QImage, QKeyEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
-    QPushButton, QScrollArea, QSplitter, QTabWidget, QTextEdit, QToolButton,
+    QPushButton, QCheckBox, QScrollArea, QSplitter, QTabWidget, QTextEdit, QToolButton,
     QVBoxLayout, QWidget,
 )
 
@@ -62,6 +62,7 @@ class ReviewPage(QWidget):
         self._export_waiting_session = None
         self._state_baseline_revision = -1
         self._closing_ui = False
+        self._force_closing_ui = False
         self._current_pixmap = QPixmap()
         self._preview_key = ""
         self._retry_context: tuple[int, str] | None = None
@@ -153,7 +154,9 @@ class ReviewPage(QWidget):
         self.accept_button.setProperty("primary", True)
         self.reject_button = QPushButton("排除  R")
         self.pending_button = QPushButton("待复核  P")
-        self.export_button = QPushButton("导出图片（含未候选）")
+        self.export_pending_checkbox = QCheckBox("同时导出未候选图片")
+        self.export_pending_checkbox.setChecked(True)
+        self.export_button = QPushButton("导出图片")
         self.export_button.setObjectName("primaryButton")
         self.export_button.setProperty("primary", True)
         self.export_button.setEnabled(False)
@@ -261,6 +264,7 @@ class ReviewPage(QWidget):
         export_row.addWidget(self.export_status, 1)
         export_row.addWidget(self.open_images_button)
         export_row.addWidget(self.export_button)
+        export_row.addWidget(self.export_pending_checkbox)
         layout.addLayout(export_row)
         self._shortcuts = []
         for key, callback in (("A", self.accept_selected), ("R", self.reject_selected), ("P", self.pending_selected)):
@@ -273,6 +277,7 @@ class ReviewPage(QWidget):
     def set_session(self, session: ReviewSession | None) -> None:
         switched = session is not self.session
         self._closing_ui = False
+        self._force_closing_ui = False
         self._refresh_generation += 1
         self._render_generation += 1
         self.query.invalidate()
@@ -350,6 +355,8 @@ class ReviewPage(QWidget):
         if context != self._supplement_context:
             self.supplement_url_edit.clear()
             self._supplement_context = context
+            if not self._supplement_busy:
+                self.operation_status.clear()
         self.refresh()
 
     def failed_candidates(self, news_id: str | None = None) -> list[Any]:
@@ -457,6 +464,7 @@ class ReviewPage(QWidget):
         row_cache = dict(self._query_rows_cache)
 
         def query():
+            snapshot.scope_repository_query(news_id, allowed)
             candidates = ReviewPage._query_snapshot_candidates(snapshot, news_id, allowed, tab)
             rows = []
             for candidate in candidates:
@@ -637,6 +645,8 @@ class ReviewPage(QWidget):
         return self._items[row] if 0 <= row < len(self._items) else None
 
     def _clear_details(self) -> None:
+        # An asynchronous empty-grid refresh must not erase a completed
+        # retry/cancellation summary while its result is still being shown.
         self._bind_retry_context(self._news_filter())
         self._preview_key = ""
         self._current_pixmap = QPixmap()
@@ -867,6 +877,8 @@ class ReviewPage(QWidget):
                     or self._export_waiting_session is not None or self.exporter.busy)
 
     def _update_pending_state(self, *_args) -> None:
+        if self._closing_ui:
+            return
         if self.session is None:
             self.save_status.clear()
             self.save_retry_button.setVisible(False)
@@ -882,6 +894,8 @@ class ReviewPage(QWidget):
             self.save_retry_button.setVisible(False)
 
     def _state_saved(self, session, version: int) -> None:
+        if self._force_closing_ui:
+            return
         if session is self.session and version >= session.revision:
             self._update_pending_state()
         if self._export_waiting_session is session and self._is_state_saved(session):
@@ -892,6 +906,8 @@ class ReviewPage(QWidget):
                 and (self.state_writer.is_saved(session) or session.revision == self._state_baseline_revision))
 
     def _state_failed(self, session, version: int, error: Any) -> None:
+        if self._force_closing_ui:
+            return
         if version < session.revision:
             self._update_pending_state()
             return
@@ -1010,7 +1026,6 @@ class ReviewPage(QWidget):
         context = (id(self.session), str(news_id or ""))
         if context != self._retry_context:
             self.retry_url_edit.clear()
-            self.operation_status.clear()
             self._retry_context = context
 
     def show_retry_result(self, success: bool) -> None:
@@ -1091,19 +1106,22 @@ class ReviewPage(QWidget):
         self._start_export(session)
 
     def _start_export(self, session: ReviewSession) -> None:
-        if session is not self.session or not self.exporter.start(session):
+        include_pending = self.export_pending_checkbox.isChecked()
+        if session is not self.session or not self.exporter.start(session, include_pending=include_pending):
             self._export_waiting_session = None
             self._set_decision_buttons_enabled(True)
             return
         self._export_waiting_session = None
         self._export_requested_count = len(self.session.accepted_images()) + len(self.session.accepted_videos())
         self.export_button.setEnabled(False)
-        self.export_status.setText("正在导出已选媒体；未候选项目将保留为备选…")
+        self.export_status.setText("正在导出已选媒体；未候选项目将保留为备选…" if include_pending else "正在导出已选媒体…")
         for button in (self.accept_button, self.reject_button, self.pending_button, self.retry_button):
             button.setEnabled(False)
         self.supplement_button.setEnabled(False)
 
     def _export_done(self, session: ReviewSession, manifest: dict | None, error: str) -> None:
+        if self._force_closing_ui:
+            return
         self.export_button.setEnabled(self.session is not None and not self._supplement_busy)
         if session is not self.session:
             return
@@ -1161,6 +1179,13 @@ class ReviewPage(QWidget):
         self.state_writer.pool.close()
         self.images.pool.waitForDone(0)
         self.exporter.pool.waitForDone(0)
+
+    def begin_force_close(self) -> None:
+        """Discard queued UI/export requests; running writes may finish off-thread."""
+        self._force_closing_ui = True
+        self.begin_close()
+        self._export_waiting_session = None
+        self.setEnabled(False)
 
     def open_images_directory(self) -> None:
         if self.session is None:
