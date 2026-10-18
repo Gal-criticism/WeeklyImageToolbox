@@ -10,9 +10,11 @@ import contextlib
 from dataclasses import dataclass
 import hashlib
 import mimetypes
+import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -217,36 +219,35 @@ def _metadata_number(info: dict[str, Any], *keys: str) -> float | int | None:
 
 
 def _selected_height(info: dict[str, Any]) -> int | None:
-    heights: list[int] = []
-    direct = _metadata_number(info, "height")
-    if isinstance(direct, (int, float)) and direct > 0:
-        heights.append(int(direct))
-    for key in ("requested_formats", "formats"):
-        values = info.get(key)
-        if not isinstance(values, list):
-            continue
-        for value in values:
-            if isinstance(value, dict):
-                height = _metadata_number(value, "height")
-                if isinstance(height, (int, float)) and height > 0:
-                    heights.append(int(height))
-    return max(heights) if heights else None
+    video = _selected_video_stream(info)
+    height = _metadata_number(video, "height")
+    return int(height) if height is not None and height > 0 else None
+
+
+def _selected_video_stream(info: dict[str, Any]) -> dict[str, Any]:
+    # `formats` describes every available alternative, including unselected 4K
+    # or portrait versions. Only requested streams describe this download.
+    requested = info.get("requested_formats")
+    if isinstance(requested, list):
+        for stream in requested:
+            if (isinstance(stream, dict) and stream.get("vcodec") != "none"
+                    and (_metadata_number(stream, "height") or _metadata_number(stream, "width"))):
+                return stream
+    return info
 
 
 def _selected_size(info: dict[str, Any]) -> int | None:
-    values: list[int] = []
-    for key in ("filesize", "filesize_approx"):
-        value = _metadata_number(info, key)
-        if isinstance(value, (int, float)) and value > 0:
-            values.append(int(value))
+    exact = _metadata_number(info, "filesize")
+    if exact is not None and exact > 0:
+        return int(exact)
     requested = info.get("requested_formats")
-    if isinstance(requested, list):
-        for item in requested:
-            if isinstance(item, dict):
-                value = _metadata_number(item, "filesize", "filesize_approx")
-                if isinstance(value, (int, float)) and value > 0:
-                    values.append(int(value))
-    return sum(values) if values else None
+    if isinstance(requested, list) and requested:
+        sizes = [_metadata_number(item, "filesize", "filesize_approx")
+                 if isinstance(item, dict) else None for item in requested]
+        if all(value is not None and value > 0 for value in sizes):
+            return int(sum(sizes))
+    approximate = _metadata_number(info, "filesize_approx")
+    return int(approximate) if approximate is not None and approximate > 0 else None
 
 
 def _extension_from_path(path: Path, info: dict[str, Any]) -> str:
@@ -259,6 +260,10 @@ def _extension_from_path(path: Path, info: dict[str, Any]) -> str:
 
 def _error_code(message: str) -> str:
     lowered = message.casefold()
+    if "ffprobe unavailable" in lowered:
+        return "video_tools_missing"
+    if "video validation failed" in lowered:
+        return "invalid_video"
     if "login" in lowered or "sign in" in lowered or "private" in lowered:
         return "access_restricted"
     if "region" in lowered or "geo" in lowered:
@@ -295,11 +300,16 @@ class VideoDownloader:
         *,
         backend_factory: BackendFactory | None = None,
         ffmpeg_detector: Callable[[], bool] | None = None,
+        media_probe: Callable[[Path], dict[str, Any] | None] | None = None,
         retries: int = 2,
         timeout_seconds: int = 30,
     ):
         self.config = config or VideoConfig()
         self.backend_factory = backend_factory or _default_backend_factory
+        # Injectable backends may return synthetic media. Real yt-dlp downloads
+        # are probed; integrations can inject their own verifier explicitly.
+        self.media_probe = media_probe or (self._probe_download if backend_factory is None else None)
+        self._uses_default_probe = media_probe is None and backend_factory is None
         self._ffmpeg_detector_override = ffmpeg_detector
         self.ffmpeg_detector = ffmpeg_detector or (lambda: _default_ffmpeg_detector(self.config.ffmpeg_location))
         self.ffmpeg_resolution: FFmpegResolution | None = None
@@ -337,6 +347,7 @@ class VideoDownloader:
             "outtmpl": str(staging_dir / "%(id)s.%(ext)s"),
             "noplaylist": True,
             "retries": self.retries,
+            "extractor_retries": self.retries,
             "fragment_retries": self.retries,
             "socket_timeout": self.timeout_seconds,
             "quiet": True,
@@ -383,14 +394,11 @@ class VideoDownloader:
                     result.append(candidate)
                     continue
 
-                self._process_one(
-                    candidate,
-                    staging_path,
-                    output_path,
-                    reserved_names,
-                    accepted_by_news,
-                    failures,
-                )
+                with tempfile.TemporaryDirectory(prefix="item-", dir=staging_path) as item_stage:
+                    self._process_one(
+                        candidate, Path(item_stage), output_path,
+                        reserved_names, accepted_by_news, failures,
+                    )
                 result.append(candidate)
         finally:
             shutil.rmtree(staging_path, ignore_errors=True)
@@ -437,10 +445,16 @@ class VideoDownloader:
         accepted_by_news: dict[str, int],
         failures: list[FailureRecord],
     ) -> None:
-        ffmpeg, ffmpeg_location = self._ffmpeg_state()
         candidate.status = VideoStatus.DOWNLOADING
-        options = self._options(staging_path, ffmpeg=ffmpeg, ffmpeg_location=ffmpeg_location)
         try:
+            ffmpeg, ffmpeg_location = self._ffmpeg_state()
+            if self._uses_default_probe and not self._probe_executable():
+                raise RuntimeError("ffprobe unavailable; 请在设置中检查视频工具后继续任务。")
+            options = self._options(staging_path, ffmpeg=ffmpeg, ffmpeg_location=ffmpeg_location)
+            if (urlsplit(candidate.video_url).hostname or "").casefold() == "video.twimg.com":
+                # X's direct MP4/HLS extractor often has no dimensions until
+                # the file is read; verify those dimensions after downloading.
+                options["format"] = options["format"].replace("height<=", "height<=?")
             with _backend_context(self.backend_factory, options) as backend:
                 info = backend.extract_info(candidate.video_url, download=False)
                 if not isinstance(info, dict):
@@ -463,8 +477,10 @@ class VideoDownloader:
                     self._skip(candidate, "height_exceeded", failures)
                     return
 
-                accepted_by_news[candidate.news_id] += 1
-                output_result = backend.download([candidate.video_url])
+                process_info = getattr(backend, "process_info", None)
+                # Download the already selected metadata/streams. Calling
+                # download(URL) again would repeat extraction and selection.
+                output_result = process_info(info) if callable(process_info) else backend.download([candidate.video_url])
                 downloaded_file = self._find_downloaded_file(
                     staging_path, output_result, backend, info
                 )
@@ -477,6 +493,21 @@ class VideoDownloader:
                     self._skip(candidate, "file_size_exceeded", failures)
                     downloaded_file.unlink(missing_ok=True)
                     return
+
+                if self.media_probe is not None:
+                    measured = self.media_probe(downloaded_file)
+                    if measured is None:
+                        raise ValueError("video validation failed (no probe result)")
+                    else:
+                        candidate.width = measured.get("width")
+                        candidate.height = measured.get("height")
+                        candidate.duration_seconds = measured.get("duration_seconds")
+                        if candidate.height and candidate.height > self.config.max_height:
+                            self._skip(candidate, "height_exceeded", failures)
+                            return
+                        if candidate.duration_seconds and candidate.duration_seconds > self.config.max_duration_seconds:
+                            self._skip(candidate, "duration_exceeded", failures)
+                            return
 
                 digest, byte_size = self._hash_file(downloaded_file)
                 extension = _extension_from_path(downloaded_file, info)
@@ -502,16 +533,21 @@ class VideoDownloader:
                 candidate.downloadable = True
                 candidate.status = VideoStatus.DOWNLOADED
                 candidate.failure_reason = None
+                candidate.review_reasons = [reason for reason in candidate.review_reasons if reason not in {
+                    "height_exceeded", "file_size_exceeded", "duration_exceeded", "per_news_limit",
+                    "download_error", "format_unavailable", "timeout", "invalid_video",
+                }]
+                accepted_by_news[candidate.news_id] += 1
         except Exception as exc:
             candidate.status = VideoStatus.FAILED
             candidate.downloadable = False
-            candidate.failure_reason = str(exc)
+            candidate.failure_reason = str(exc).strip() or f"视频下载失败（{type(exc).__name__}）。"
             failures.append(
                 self._failure(
                     candidate,
-                    _error_code(str(exc)),
-                    str(exc),
-                    retryable=True,
+                    _error_code(candidate.failure_reason),
+                    candidate.failure_reason,
+                    retryable=_error_code(candidate.failure_reason) != "invalid_video",
                 )
             )
 
@@ -522,7 +558,7 @@ class VideoDownloader:
         if info.get("uploader") is not None:
             candidate.uploader = str(info["uploader"])
         candidate.duration_seconds = _metadata_number(info, "duration")
-        candidate.width = _metadata_number(info, "width")
+        candidate.width = _metadata_number(_selected_video_stream(info), "width")
         candidate.height = _selected_height(info)
         candidate.format = str(info.get("format_id") or info.get("format") or info.get("ext") or "") or None
         if info.get("mime_type"):
@@ -538,20 +574,47 @@ class VideoDownloader:
     ) -> Path | None:
         if isinstance(download_result, (str, Path)):
             path = Path(download_result)
-            if path.is_file():
+            if path.is_file() and path.resolve().is_relative_to(staging_path.resolve()):
                 return path
-        files = [path for path in staging_path.rglob("*") if path.is_file()]
-        if files:
-            return max(files, key=lambda path: path.stat().st_mtime_ns)
         prepare_filename = getattr(backend, "prepare_filename", None)
         if callable(prepare_filename):
             try:
                 path = Path(prepare_filename(info))
-                if path.is_file():
+                if path.is_file() and path.resolve().is_relative_to(staging_path.resolve()):
                     return path
             except Exception:
                 pass
-        return None
+        files = [path for path in staging_path.rglob("*") if path.is_file()
+                 and path.suffix.casefold() in {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi", ".mpeg", ".mpg"}]
+        return max(files, key=lambda path: path.stat().st_mtime_ns) if files else None
+
+    def _probe_executable(self) -> str | None:
+        resolution = self.ffmpeg_resolution or resolve_ffmpeg_location(self.config.ffmpeg_location)
+        return resolution.ffprobe_path or shutil.which("ffprobe")
+
+    def _probe_download(self, path: Path) -> dict[str, Any]:
+        executable = self._probe_executable()
+        if not executable:
+            raise RuntimeError("ffprobe unavailable; 请在设置中检查视频工具后继续任务。")
+        try:
+            result = subprocess.run(
+                [str(executable), "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            if result.returncode:
+                raise ValueError("ffprobe could not read the media")
+            payload = json.loads(result.stdout)
+            stream = next((entry for entry in payload.get("streams", [])
+                           if entry.get("codec_type") == "video"
+                           and not entry.get("disposition", {}).get("attached_pic")), None)
+            if stream is None or not stream.get("width") or not stream.get("height"):
+                raise ValueError("no playable video stream")
+            duration = payload.get("format", {}).get("duration") or stream.get("duration")
+            return {"width": int(stream["width"]), "height": int(stream["height"]),
+                    "duration_seconds": float(duration) if duration is not None else None}
+        except Exception as exc:
+            raise ValueError(f"video validation failed ({type(exc).__name__})") from exc
 
     @staticmethod
     def _hash_file(path: Path) -> tuple[str, int]:

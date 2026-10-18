@@ -15,6 +15,11 @@ def resolve_review_index_root(value: Path | str) -> Path:
     root = Path(value).expanduser().resolve()
     if root.is_file():
         root = root.parent
+    from ..tasks.repository import TaskRepository
+    for candidate in (root, root.parent if root.name.casefold() in {"raw", "final", "assets"} else root,
+                      root.parent.parent if root.name.casefold() == "images" else root):
+        if TaskRepository.is_authoritative(candidate):
+            return candidate / "raw"
     candidates = [root, root / "raw"]
     if root.name.casefold() == "images" and root.parent.name.casefold() in {"raw", "final"}:
         candidates.append(root.parent.parent / "raw")

@@ -12,6 +12,7 @@ from ..domain import FailureRecord, FailureStage, ImageCandidate, ImageCurationS
 from ..curation.review_filter import is_low_resolution, reviewable_pending_images
 from .image_conversion import ImageConversionError, ImageConverter
 from .helpers import atomic_json_write, item_names as canonical_item_names, safe_video_name, section_label, section_prefix
+from ..tasks.assets import TaskAssets
 
 
 class OutputManager:
@@ -37,15 +38,19 @@ class OutputManager:
     @classmethod
     def _save_review_image(cls, candidate: ImageCandidate, source: Path, root: Path, destination: Path) -> bool:
         source_bytes = source.read_bytes()
+        task_assets = TaskAssets.for_path(root)
         converter = ImageConverter()
         try:
             converted = converter.convert(source_bytes, candidate)
         except ImageConversionError as exc:
-            original_dir = root / "originals" / candidate.news_id
-            original_dir.mkdir(parents=True, exist_ok=True)
-            original = original_dir / f"{candidate.id}.source{source.suffix.casefold()}"
-            if source.resolve() != original.resolve():
-                shutil.copyfile(source, original)
+            if task_assets:
+                original = task_assets.put_original(source, source.suffix.casefold() or ".img")
+            else:
+                original_dir = root / "originals" / candidate.news_id
+                original_dir.mkdir(parents=True, exist_ok=True)
+                original = original_dir / f"{candidate.id}.source{source.suffix.casefold()}"
+                if source.resolve() != original.resolve():
+                    shutil.copyfile(source, original)
             candidate.original_path = str(original)
             candidate.original_mime_type = candidate.original_mime_type or candidate.mime_type
             candidate.original_byte_size = len(source_bytes)
@@ -63,11 +68,14 @@ class OutputManager:
             "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
             "image/webp": ".webp", "image/avif": ".avif",
         }[converted.original_mime_type]
-        original_dir = root / "originals" / candidate.news_id
-        original_dir.mkdir(parents=True, exist_ok=True)
-        original = original_dir / f"{candidate.id}.source{source_suffix}"
-        if source.resolve() != original.resolve():
-            shutil.copyfile(source, original)
+        if task_assets:
+            original = task_assets.put_original(source_bytes, source_suffix)
+        else:
+            original_dir = root / "originals" / candidate.news_id
+            original_dir.mkdir(parents=True, exist_ok=True)
+            original = original_dir / f"{candidate.id}.source{source_suffix}"
+            if source.resolve() != original.resolve():
+                shutil.copyfile(source, original)
         candidate.original_path = str(original)
         candidate.original_mime_type = converted.original_mime_type
         candidate.original_byte_size = len(source_bytes)
@@ -83,8 +91,10 @@ class OutputManager:
                 candidate.review_reasons.append(ReviewReason.IMAGE_TYPE_REVIEW)
             candidate.signals["animated_source"] = True
         destination = destination.with_suffix(".jpg" if converted.mime_type == "image/jpeg" else ".png")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(converted.data)
+        destination = task_assets.put_review(converted.data, destination.suffix, profile="v1") if task_assets else destination
+        if not task_assets:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(converted.data)
         candidate.local_path = str(destination)
         candidate.output_mime_type = converted.mime_type
         candidate.output_byte_size = len(converted.data)
@@ -140,6 +150,14 @@ class OutputManager:
 
     def _atomic_json(self, path: Path, payload) -> None:
         atomic_json_write(path, payload, default=str)
+
+    @staticmethod
+    def _record_output_file(files: list[str], path: str | Path, root: Path) -> None:
+        try:
+            files.append(str(Path(path).relative_to(root)))
+        except ValueError:
+            # Task assets intentionally live outside the publication snapshot.
+            pass
 
     @classmethod
     def _is_reviewable_failed_candidate(cls, candidate: ImageCandidate) -> bool:
@@ -221,7 +239,7 @@ class OutputManager:
             target_dir.mkdir(parents=True, exist_ok=True)
             target = target_dir / f"{readable}.{rank:02d}.png"
             if self._save_review_image(candidate, source_path, root, target):
-                files.append(str(Path(candidate.local_path).relative_to(root)))
+                self._record_output_file(files, candidate.local_path, root)
         all_candidates = result.all_candidates
         exported_failed: set[int] = set()
         internally_reviewable: set[int] = set()
@@ -256,7 +274,7 @@ class OutputManager:
                 target = root / "review_assets" / candidate.news_id / f"{candidate.id}.png"
                 if self._save_review_image(candidate, source_path, root, target):
                     internally_reviewable.add(id(candidate))
-                    files.append(str(Path(candidate.local_path).relative_to(root)))
+                    self._record_output_file(files, candidate.local_path, root)
             for rank, candidate in enumerate(failed, 1):
                 readable = re.sub(r"[\\/:*?\"<>|]", "_", item_names.get(news_id, news_id))
                 target_dir = image_root / readable / self._UNSELECTED_CANDIDATE_DIR
@@ -265,7 +283,7 @@ class OutputManager:
                 if source_path is None or not self._save_review_image(candidate, source_path, root, target):
                     continue
                 exported_failed.add(id(candidate))
-                files.append(str(Path(candidate.local_path).relative_to(root)))
+                self._record_output_file(files, candidate.local_path, root)
         videos = list(getattr(result, "videos", []) or [])
         video_reserved: dict[str, set[str]] = {}
         for video in videos:
@@ -295,7 +313,7 @@ class OutputManager:
             # Preserve landed originals even when later policy marks a
             # candidate invalid and therefore does not export a review image.
             source_path = self._image_source(candidate)
-            if source_path is not None and not source_path.resolve().is_relative_to(root.resolve()):
+            if source_path is not None and not TaskAssets.for_path(root) and not source_path.resolve().is_relative_to(root.resolve()):
                 original_dir = root / "originals" / candidate.news_id
                 original_dir.mkdir(parents=True, exist_ok=True)
                 original = original_dir / f"{candidate.id}.source{source_path.suffix.casefold()}"

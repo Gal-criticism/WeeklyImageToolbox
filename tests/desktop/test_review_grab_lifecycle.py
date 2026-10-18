@@ -98,22 +98,27 @@ def test_retry_and_verification_background_preserve_latest_decision(qtbot, qapp,
         controller.task_store.close()
 
 
-def test_window_waits_for_retry_merge_and_state_write(qtbot, tmp_path):
+def test_confirmed_close_cancels_retry_without_waiting_or_merging(qtbot, tmp_path, monkeypatch):
     runner = SlowRunner()
     controller, _record, session = fixture_controller(tmp_path, runner)
-    window = MainWindow(controller)
+    exited = []
+    window = MainWindow(controller, exit_handler=lambda: exited.append(True))
+    monkeypatch.setattr(window, "_confirm_force_close", lambda: True)
     qtbot.addWidget(window)
     window.show()
     try:
         assert controller.retry_news("news-1", "https://public.example/gallery")
         qtbot.waitUntil(runner.entered.is_set)
-        assert window.close() is False
-        assert window.isVisible()
+        assert window.close() is True
+        assert not window.isVisible()
+        assert exited == [True]
         assert runner.calls[0]["cancellation_token"].is_cancelled
+        assert controller.is_supplement_running
+        assert not runner.release.is_set()
         runner.release.set()
-        qtbot.waitUntil(lambda: not window.isVisible(), timeout=5000)
-        assert not controller.has_pending_work
-        assert any(str(item.id) == "new" for item in session.images)
+        qtbot.waitUntil(lambda: not controller.is_supplement_running, timeout=5000)
+        assert not any(str(item.id) == "new" for item in session.images)
+        assert (session.task_root / "retries" / "news-1" / "retry-local" / "new.png").is_file()
     finally:
         runner.release.set()
         controller.close(5000)

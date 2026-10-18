@@ -88,7 +88,7 @@ def test_export_waits_for_latest_state_write(qtbot, tmp_path, monkeypatch):
     assert page.state_writer.busy
 
     called = []
-    monkeypatch.setattr(page.exporter, "start", lambda value: called.append(value) or False)
+    monkeypatch.setattr(page.exporter, "start", lambda value, **kwargs: called.append(value) or False)
     page.export_final()
     assert page._export_waiting_session is session
     assert not called

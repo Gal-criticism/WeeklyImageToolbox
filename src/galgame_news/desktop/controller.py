@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sqlite3
 import uuid
+from threading import Event
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -16,6 +18,7 @@ from ..review import ReviewSession
 from ..delivery.asset_paths import resolve_review_index_root
 from ..settings import CredentialStore, InMemoryCredentialBackend, SettingsStore
 from ..tasks import TaskRecord, TaskStore
+from ..tasks.migration import migrate_task
 from .history_page import HistoryPage
 from .new_task_page import NewTaskPage
 from .progress_page import ProgressPage
@@ -25,6 +28,38 @@ from .theme import apply_theme
 from .worker import PipelineWorker, ReviewGrabWorker
 from ..diagnostics import diagnose_error, format_error
 from .review_jobs import ReviewQuery
+
+
+class _TaskMigrationWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(object)
+
+    def __init__(self, task_root: Path, review_state_path: Path | None = None,
+                 private_task_root: Path | None = None):
+        super().__init__()
+        self.task_root = task_root
+        self.review_state_path = review_state_path
+        self.private_task_root = private_task_root
+        self.cancelled = Event()
+
+    def cancel(self):
+        self.cancelled.set()
+
+    @Slot()
+    def run(self):
+        try:
+            from ..tasks.repository import TaskRepository
+            options = {"cancelled": self.cancelled}
+            if not TaskRepository.is_authoritative(self.task_root):
+                if self.review_state_path is not None and self.review_state_path.exists():
+                    options["review_state_override"] = json.loads(
+                        self.review_state_path.read_text(encoding="utf-8"))
+                if self.private_task_root is not None:
+                    options["private_task_root"] = self.private_task_root
+            report = migrate_task(self.task_root, **options)
+            self.finished.emit(report)
+        except BaseException as exc:
+            self.failed.emit(exc)
 
 
 class DesktopController(QObject):
@@ -88,6 +123,7 @@ class DesktopController(QObject):
         self.progress_page.resume_requested.connect(self.resume_current_task)
         self.progress_page.stop_requested.connect(self.cancel_task)
         self.history_page.review_requested.connect(self._load_review_from_page)
+        self.history_page.migration_requested.connect(self.migration_task)
         self.history_page.resume_requested.connect(self.resume_task)
         self.review_page.retry_requested.connect(self._retry_from_page)
         self.retry_failed.connect(self.review_page.show_retry_failure)
@@ -105,15 +141,32 @@ class DesktopController(QObject):
         self._supplement_active = False
         self._grab_result_done = self._grab_thread_done = False
         self._closing = False
+        self._force_closing = False
+        self._migration_active = False
+        self._migration_thread: QThread | None = None
+        self._migration_worker: _TaskMigrationWorker | None = None
+        self._migration_record: TaskRecord | None = None
+        self._migration_result: dict[str, Any] | None = None
+        self._migration_error: BaseException | None = None
         self._review_load_generation = 0
         self._review_loader = ReviewQuery(self)
         self._review_loader.ready.connect(self._review_load_ready)
         self._review_loader.idle.connect(self.work_changed)
+        self.work_changed.connect(self._update_migration_action)
+        self.task_started.connect(self._update_migration_action)
+        self.task_finished.connect(self._update_migration_action)
+        self.task_cancelled.connect(self._update_migration_action)
+        self.task_failed.connect(self._update_migration_action)
+        self._review_loader.idle.connect(self._update_migration_action)
+        self.review_page.state_writer.idle.connect(self._update_migration_action)
+        self.review_page.exporter.finished.connect(self._update_migration_action)
+        self.review_page.export_button.clicked.connect(self._update_migration_action)
         self.current_request: TaskRequest | None = None
         self.current_record: TaskRecord | None = None
         self.review_record: TaskRecord | None = None
         self.last_result: Any = None
         self.last_error: BaseException | None = None
+        self._update_migration_action()
 
     @property
     def worker(self) -> PipelineWorker | None:
@@ -138,8 +191,123 @@ class DesktopController(QObject):
     @property
     def has_pending_work(self) -> bool:
         page = self.review_page
-        return bool(self.is_running or self.is_supplement_running or
+        return bool(self.is_running or self.is_supplement_running or self._migration_active
+                    or (self._migration_thread is not None and self._migration_thread.isRunning()) or
                     self._review_loader.busy or page.exporter.session is not None or page.has_pending_work)
+
+    @property
+    def has_active_operations(self) -> bool:
+        """User-started operations which require an exit confirmation."""
+        page = self.review_page
+        return bool(self.is_running or self.is_supplement_running or self._migration_active
+                    or (self._migration_thread is not None and self._migration_thread.isRunning())
+                    or page.exporter.busy or page._export_waiting_session is not None)
+
+    @Slot()
+    def _update_migration_action(self, *_args) -> None:
+        page = self.review_page
+        blocked = bool(self._closing or self._migration_active or self.is_running or self.is_supplement_running
+                       or self._review_loader.busy or page.exporter.busy or page._export_waiting_session is not None
+                       or page.state_writer.busy)
+        self.history_page.set_migration_blocked(blocked)
+
+    def migration_task(self, record: object) -> bool:
+        """Migrate one legacy task off the GUI thread, then reload its review session."""
+        if not isinstance(record, TaskRecord):
+            return False
+        page = self.review_page
+        if (self._closing or self._migration_active or self.is_running or self.is_supplement_running
+                or self._review_loader.busy or page.exporter.busy or page._export_waiting_session is not None
+                or page.state_writer.busy or page.has_pending_work):
+            self.history_page.show_migration_report("已有抓取、审核保存、载入或导出正在运行，请结束后再迁移。")
+            return False
+        session = page.session
+        if session is not None and not page._is_state_saved(session):
+            if not page.state_writer.has_failure(session):
+                page.state_writer.enqueue(session)
+            self.history_page.show_migration_report("审核决定正在保存；保存完成后请再次启动迁移。")
+            return False
+        try:
+            root = record.root_path
+            if record.imported and record.source_output_path is not None:
+                source = resolve_review_index_root(record.source_output_path)
+                root = source.parent if source.name.casefold() == "raw" else source
+            root = root.expanduser().resolve()
+        except (OSError, ValueError, TypeError) as exc:
+            self.history_page.show_migration_report(f"无法定位任务目录：{exc}")
+            return False
+        self._migration_active = True
+        self._migration_record = record
+        self._migration_result = None
+        self._migration_error = None
+        self.history_page.set_migration_busy(True)
+        self.history_page.show_migration_report(f"正在迁移任务存储：{root}")
+        self.review_page.setEnabled(False)
+        self.new_task_page.set_busy(True)
+        self._migration_worker = _TaskMigrationWorker(
+            root, record.review_state_path if record.imported else None,
+            record.root_path if record.imported else None)
+        self._migration_thread = QThread(self)
+        self._migration_worker.moveToThread(self._migration_thread)
+        self._migration_thread.started.connect(self._migration_worker.run)
+        self._migration_worker.finished.connect(self._on_migration_finished)
+        self._migration_worker.failed.connect(self._on_migration_failed)
+        self._migration_worker.finished.connect(self._migration_thread.quit, Qt.ConnectionType.DirectConnection)
+        self._migration_worker.failed.connect(self._migration_thread.quit, Qt.ConnectionType.DirectConnection)
+        self._migration_thread.finished.connect(self._migration_worker.deleteLater)
+        self._migration_thread.finished.connect(self._on_migration_thread_finished)
+        self.work_changed.emit()
+        self._migration_thread.start()
+        return True
+
+    @Slot(object)
+    def _on_migration_finished(self, report: object) -> None:
+        if self._force_closing:
+            return
+        self._migration_result = report if isinstance(report, dict) else {"migrated": False}
+
+    @Slot(object)
+    def _on_migration_failed(self, error: object) -> None:
+        if self._force_closing:
+            return
+        self._migration_error = error if isinstance(error, BaseException) else RuntimeError(str(error))
+
+    @Slot()
+    def _on_migration_thread_finished(self) -> None:
+        if self.sender() is not self._migration_thread:
+            return
+        thread = self._migration_thread
+        record, report, error = self._migration_record, self._migration_result, self._migration_error
+        self._migration_active = False
+        self._migration_thread = self._migration_worker = None
+        self._migration_record = None
+        self._migration_result = None
+        self._migration_error = None
+        if thread is not None:
+            thread.deleteLater()
+        if self._force_closing:
+            return
+        self.history_page.set_migration_busy(False)
+        self.review_page.setEnabled(True)
+        self.new_task_page.set_busy(self.is_running or self.is_supplement_running)
+        if error is not None:
+            self.history_page.show_migration_report(f"迁移失败，原任务文件保留：{error}")
+        else:
+            report = report or {}
+            counts = report.get("counts", {})
+            summary = "、".join(f"{name} {count} 项" for name, count in sorted(counts.items())) or "无新记录"
+            diagnostics = report.get("diagnostics", [])
+            warning_count = len(report.get("warnings", [])) + len(diagnostics)
+            label = "已是 SQLite 权威存储" if report.get("already_authoritative") else "迁移完成" if report.get("migrated") else "迁移未完成"
+            message = f"{label}：{summary}。"
+            if warning_count:
+                message += f" 诊断 {warning_count} 条；详情见技术信息。"
+            self.history_page.show_migration_report(message)
+            if diagnostics:
+                self.review_page.show_diagnostics(diagnostics)
+            if report.get("migrated") and record is not None and not self._closing:
+                self._load_review_from_page(record)
+        self.work_changed.emit()
 
     def _start_from_page(self, payload: object) -> bool:
         values = dict(payload) if isinstance(payload, dict) else {}
@@ -161,7 +329,7 @@ class DesktopController(QObject):
         task_dir: Path | str | None = None,
         task_id: str | None = None,
     ) -> bool:
-        if (self._closing or self.is_running or self.is_supplement_running or self._review_loader.busy
+        if (self._closing or self._migration_active or self.is_running or self.is_supplement_running or self._review_loader.busy
                 or self.review_page.exporter.busy or self.review_page._export_waiting_session is not None):
             return False
         if request is None:
@@ -219,6 +387,7 @@ class DesktopController(QObject):
         self._worker.cancelled.connect(self._thread.quit, Qt.ConnectionType.DirectConnection)
         self._worker.failed.connect(self._thread.quit, Qt.ConnectionType.DirectConnection)
         self._thread.finished.connect(self._on_thread_finished)
+        self._thread.finished.connect(self._update_migration_action)
         self._thread.start()
         self.task_started.emit(request)
         self.taskStarted.emit(request)
@@ -229,7 +398,7 @@ class DesktopController(QObject):
         # progress page to use the same verb for an in-place pause/resume.
         if record is None:
             return self.resume_current_task()
-        if not isinstance(record, TaskRecord) or self.is_running:
+        if not isinstance(record, TaskRecord) or self.is_running or self._migration_active:
             return False
         if record.input_path is None or record.images_only:
             return False
@@ -261,6 +430,8 @@ class DesktopController(QObject):
 
     @Slot(object)
     def _on_event(self, event: object) -> None:
+        if self._force_closing:
+            return
         if isinstance(event, ProgressEvent):
             if event.kind == "task_workspace_ready" and self.current_record is not None and self.current_request is not None:
                 root = Path(event.payload.get("task_dir", ""))
@@ -278,6 +449,9 @@ class DesktopController(QObject):
 
     @Slot(object)
     def _on_finished(self, result: object) -> None:
+        if self._force_closing:
+            self._quit_thread()
+            return
         self.last_result = result
         self._bind_result_task_dir(result)
         self.progress_page.set_finished("Completed")
@@ -291,6 +465,9 @@ class DesktopController(QObject):
 
     @Slot(object)
     def _on_cancelled(self, value: object) -> None:
+        if self._force_closing:
+            self._quit_thread()
+            return
         self.last_result = value
         self._bind_result_task_dir(value)
         self.progress_page.set_finished("Cancelled")
@@ -301,6 +478,9 @@ class DesktopController(QObject):
 
     @Slot(object)
     def _on_failed(self, error: object) -> None:
+        if self._force_closing:
+            self._quit_thread()
+            return
         self.last_error = error if isinstance(error, BaseException) else RuntimeError(str(error))
         self._bind_result_task_dir(error)
         if isinstance(error, BaseException):
@@ -400,6 +580,8 @@ class DesktopController(QObject):
             self.history_changed.emit()
 
     def import_output(self, path: str | Path) -> TaskRecord:
+        if self._migration_active:
+            raise RuntimeError("任务存储迁移期间不能导入或切换审核任务")
         record = self.task_store.import_output(path)
         self.history_page.refresh()
         self.load_review(record)
@@ -412,7 +594,7 @@ class DesktopController(QObject):
             QMessageBox.warning(self.new_task_page, "无法导入图片结果", str(exc))
 
     def load_review(self, record: object) -> ReviewSession | None:
-        if (self.is_supplement_running or self.review_page.exporter.busy or self.review_page.state_writer.busy
+        if (self._migration_active or self.is_supplement_running or self.review_page.exporter.busy or self.review_page.state_writer.busy
                 or self.review_page.state_writer.has_failure()):
             return self.review_page.session
         if not isinstance(record, TaskRecord):
@@ -441,7 +623,9 @@ class DesktopController(QObject):
                 task_root=export_root,
                 state_path=record.review_state_path,
             )
-            session.retry_root = record.root_path / "retries"
+            session.retry_root = self.task_store.storage_root(record) / "retries"
+            if record.imported and session.retry_root.parent != record.root_path.resolve():
+                session.legacy_retry_roots = (record.root_path.resolve() / "retries",)
             for attempt in self.task_store.list_retry_attempts(record):
                 try:
                     session.merge_retry_attempt(attempt, force_pending=attempt.kind == "supplement")
@@ -462,7 +646,7 @@ class DesktopController(QObject):
     @Slot(object)
     def _load_review_from_page(self, record):
         """History clicks load/validate their indexes off the GUI thread."""
-        if self._closing or self.is_supplement_running or self.review_page.exporter.session is not None:
+        if self._closing or self._migration_active or self.is_supplement_running or self.review_page.exporter.session is not None:
             return
         if not isinstance(record, TaskRecord):
             return
@@ -470,7 +654,7 @@ class DesktopController(QObject):
         self._queue_review_load(record, self._review_load_generation)
 
     def _queue_review_load(self, record, generation):
-        if self._closing or generation != self._review_load_generation:
+        if self._closing or self._migration_active or generation != self._review_load_generation:
             return
         if self.review_page.state_writer.busy:
             QTimer.singleShot(30, lambda: self._queue_review_load(record, generation))
@@ -489,9 +673,11 @@ class DesktopController(QObject):
             if record.imported and source.name.casefold() != "raw":
                 export_root = source.parent / f"{source.name}_审核结果"
             session = ReviewSession.from_output(source, task_root=export_root, state_path=record.review_state_path)
-            session.retry_root = record.root_path / "retries"
             store = TaskStore(app_data, recover_on_startup=False)
             try:
+                session.retry_root = store.storage_root(record) / "retries"
+                if record.imported and session.retry_root.parent != record.root_path.resolve():
+                    session.legacy_retry_roots = (record.root_path.resolve() / "retries",)
                 for attempt in store.list_retry_attempts(record):
                     try:
                         session.merge_retry_attempt(attempt, force_pending=attempt.kind == "supplement", persist=False)
@@ -591,7 +777,7 @@ class DesktopController(QObject):
         return self._start_review_grab("supplement", news_id, source_url)
 
     def _start_review_grab(self, kind: str, news_id: str, source_url: str) -> bool:
-        if (self._closing or self.is_running or self.is_supplement_running or self._review_loader.busy
+        if (self._closing or self._migration_active or self.is_running or self.is_supplement_running or self._review_loader.busy
                 or self.review_page.exporter.busy or self.review_page._export_waiting_session is not None):
             self._show_grab_error(kind, RuntimeError("已有抓取或导出操作正在运行，请稍后重试"))
             if self.is_supplement_running:
@@ -607,8 +793,9 @@ class DesktopController(QObject):
             return False
         try:
             options = self.task_store.load_request_options(record)
-            request = TaskRequest(input_path=record.input_path or record.root_path / "input.docx",
-                issue_id=record.issue_id, output_dir=record.root_path, task_id=record.task_id,
+            storage_root = self.task_store.storage_root(record)
+            request = TaskRequest(input_path=record.input_path or storage_root / "input.docx",
+                issue_id=record.issue_id, output_dir=storage_root, task_id=record.task_id,
                 no_videos=True, offline=bool(options.get("offline", False)),
                 use_socialdata_x=bool(options.get("use_socialdata_x", False)),
                 selected_sections=options.get("selected_sections", ["x", "h", "z"]),
@@ -618,7 +805,7 @@ class DesktopController(QObject):
             runner._supplement_credential_store = self.credential_store
             token = CancellationToken()
             identity = (record.task_id, id(session), uuid.uuid4().hex)
-            kwargs = dict(task_root=record.root_path, task_id=record.task_id,
+            kwargs = dict(task_root=storage_root, task_id=record.task_id,
                           issue_id=record.issue_id, news_id=str(news_id),
                           news_item=dict(news), request=request)
             kwargs["source_url" if kind == "supplement" else "official_url"] = source_url.strip()
@@ -660,11 +847,17 @@ class DesktopController(QObject):
 
     @Slot(object)
     def _on_supplement_event(self, event):
+        if self._force_closing:
+            return
         if self.sender() is self._supplement_worker and self._supplement_context is not None:
             self.review_page.operation_status.setText(str(event.message))
 
     @Slot(object)
     def _on_supplement_finished(self, value):
+        if self._force_closing:
+            self._grab_result_done = True
+            self._finish_grab_if_ready()
+            return
         identity, result, delta = value
         context = self._supplement_context
         if context is None or context[0] != identity:
@@ -709,6 +902,10 @@ class DesktopController(QObject):
 
     @Slot(object)
     def _on_supplement_failed(self, value):
+        if self._force_closing:
+            self._grab_result_done = True
+            self._finish_grab_if_ready()
+            return
         identity, error = value
         if self._supplement_context is None or self._supplement_context[0] != identity:
             return
@@ -742,6 +939,8 @@ class DesktopController(QObject):
         self._supplement_context = None
         if completed_thread is not None:
             completed_thread.deleteLater()
+        if self._force_closing:
+            return
         self.review_page.set_supplement_busy(False)
         self.new_task_page.set_busy(self.is_running)
         self.work_changed.emit()
@@ -770,6 +969,27 @@ class DesktopController(QObject):
         # catalog in the next process.
         self.history_page.refresh()
 
+    def begin_force_close(self) -> None:
+        """Invalidate UI work and request cancellation without joining anything.
+
+        The actual entry point owns process termination; this hook performs no
+        file IO, database access or wait, even when a writer has failed.
+        """
+        if self._force_closing:
+            return
+        self._closing = self._force_closing = True
+        self._review_load_generation += 1
+        self._review_loader.invalidate()
+        self.review_page.begin_force_close()
+        self.new_task_page.setEnabled(False)
+        self.progress_page.setEnabled(False)
+        self.history_page.setEnabled(False)
+        self.settings_page.setEnabled(False)
+        if self._migration_worker is not None:
+            self._migration_worker.cancel()
+        self.cancel_supplement()
+        self.cancel_task()
+
     def close(self, timeout_ms: int = 1000) -> bool:
         self._closing = True
         self.review_page.begin_close()
@@ -777,8 +997,8 @@ class DesktopController(QObject):
         self._review_loader.invalidate()
         self.cancel_supplement()
         self.cancel_task()
-        # Normal window closing calls with zero timeout and polls asynchronously.
-        # Legacy callers may request a bounded wait, while queued completion and
+        # Explicit graceful callers may request a bounded wait; the desktop
+        # close button uses begin_force_close instead. Queued completion and
         # state-write signals still get delivered on the GUI thread.
         timer = QElapsedTimer()
         timer.start()

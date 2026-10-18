@@ -26,7 +26,13 @@ class SyncHttpBridge:
         self.runtime, self.client = runtime, client
 
     def get(self, url, *, cookies=None):
-        return self.runtime.submit(self.client.get(url, cookies=cookies))
+        response = self.runtime.submit(self.client.get(url, cookies=cookies))
+        # Only source responses for the active news are retained here. Besides
+        # avoiding a second failed request, this preserves the age-confirmed
+        # response for navigation/rendering without another cookie-less fetch.
+        if self.client is self.runtime.page_client:
+            self.runtime._source_responses[url] = response
+        return response
 
     def post_json(self, url, payload):
         return self.runtime.submit(self.client.post_json(url, payload))
@@ -69,6 +75,7 @@ class TaskNetworkRuntime:
         self._compat_slots = asyncio.Semaphore(network.page_concurrency)
         self.timings = {}
         self._active = set()
+        self._source_responses = {}
 
     async def call_sync(self, call):
         async with self._compat_slots:
@@ -94,7 +101,13 @@ class TaskNetworkRuntime:
     async def resolve(self, resolver, news):
         return await self._timed("resolve", resolve_async(resolver, news, self.page_client, self.call_sync))
 
-    async def collect_many(self, news, sources, request):
+    async def collect_many(self, news, sources, request, *, _goods_expand=True):
+        if _goods_expand:
+            self._source_responses.clear()
+        from ..discovery.goods_context import is_goods_news
+        if _goods_expand and is_goods_news(news) and self.runner.adapter_factory is None and not request.offline:
+            from .goods_collection import collect_goods
+            return await collect_goods(self, news, sources, request)
         if not getattr(self.runner, "_localization_service", None):
             from ..localization.service import LocalizationImageService
             self.runner._localization_service = LocalizationImageService(self.page_bridge)
@@ -120,21 +133,39 @@ class TaskNetworkRuntime:
         context = CollectionContext(timeout_seconds=self.runner.config.network.timeout_seconds,
                                     max_candidates=self.runner.config.search.max_candidates_per_source)
         for source, result in zip(sources, results):
-            if isinstance(result, Exception) or source.source_type is not SourceType.OFFICIAL_SITE:
+            from ..discovery.goods_service import GoodsSourceService, goods_page_text
+            goods = GoodsSourceService.supports(news, source)
+            active_parser = GoodsSourceService(self.page_bridge) if goods else parser
+            if isinstance(result, Exception) or (source.source_type is not SourceType.OFFICIAL_SITE and not goods):
                 continue
             try:
-                response = await self.page_client.get(source.url)
-                if not await self.call_sync(lambda: parser.needs_render(response.text, result)):
+                response = self._source_responses.get(source.url)
+                if response is None:
+                    # Collection failed before receiving a response; do not
+                    # repeat requests just to decide whether to render it.
+                    if result.failures:
+                        continue
+                    response = await self.page_client.get(source.url)
+                if not 200 <= response.status_code < 300:
                     continue
-                rendered = await self._timed("browser_render", self.browser.render(response.url, news.id, response.text))
+                response_text = goods_page_text(response) if goods else response.text
+                needs_render = (lambda: active_parser.needs_render(response_text, result, str(response.url))) if goods else (lambda: parser.needs_render(response_text, result))
+                if not await self.call_sync(needs_render):
+                    continue
+                rendered = await self._timed("browser_render", self.browser.render(response.url, news.id, response_text))
+                if goods:
+                    if not hasattr(self, "_goods_snapshots"):
+                        self._goods_snapshots = {}
+                    self._goods_snapshots[source.url] = rendered.snapshots
                 self.token.raise_if_cancelled()
                 by_id = {candidate.id: candidate for candidate in result.candidates}
                 resolved = False
                 for snapshot in rendered.snapshots:
-                    parsed = await self.call_sync(lambda: parser.parse(news, source, context, snapshot.html,
+                    parsed = await self.call_sync(lambda: active_parser.parse(news, source, context, snapshot.html,
                                                                         page_url=snapshot.url, method="browser"))
                     result.failures.extend(parsed.failures)
-                    resolved = resolved or not await self.call_sync(lambda: parser.needs_render(snapshot.html, parsed))
+                    snapshot_needs_render = (lambda: active_parser.needs_render(snapshot.html, parsed, snapshot.url)) if goods else (lambda: parser.needs_render(snapshot.html, parsed))
+                    resolved = resolved or not await self.call_sync(snapshot_needs_render)
                     for candidate in parsed.candidates:
                         prior = by_id.get(candidate.id)
                         if prior is None:

@@ -93,23 +93,27 @@ SocialData 为可选的 X 媒体查询服务，默认关闭。只有你自行拥
 
 补抓 X 沿用创建任务时的 SocialData 开关，默认关闭的任务不会自动付费查询。启用时同帖复用缓存和凭据库；补抓不下载视频。离线任务不能抓取补充网络链接。
 
-补抓原件、审阅图和索引位于本任务 `retries` 批次目录，重新打开历史任务后仍可审核和导出。不要删除这些依赖文件。
+SQLite 任务的补抓批次记录保存在数据库中，新增原件与审阅图复用任务内 `assets` 文件；旧任务仍沿用 `retries` 批次目录。重新打开历史任务后仍可审核和导出。不要删除这些依赖文件。
 
 ### 导出内容与文件夹
 
 点击“导出图片（含未候选）”生成最终图片交付。`final/images` 内含已选图片及通过筛选的未候选备选。请在审核页底部查看实际导出目录。
 
-任务目录会保留原始下载资源、索引、检查点、缓存和审核状态，便于追溯和续跑。`review_assets` 是审核界面使用的内部资源，不代表全部可交付备选；用户应以 `final/images` 为准。
+任务目录会保留原始下载资源、索引、检查点、缓存和审核状态，便于追溯和续跑。新任务以 `task_state.sqlite3` 保存状态，原件与审阅件位于 `assets`，`raw` 中的 JSON 是发布快照；旧任务迁移前继续读取原有 JSON。内部审阅文件不代表全部可交付备选；用户应以 `final/images` 为准。迁移、完整性检查和备份见[任务存储说明](storage.md)。
 
-如果仅有 `final/images` 而没有任务索引，工具不能重建审核界面；可以直接打开该文件夹人工挑选图片。
+如果仅有 `final/images` 而没有任务数据库或旧索引，工具不能重建审核界面；可以直接打开该文件夹人工挑选图片。
 
 ## 命令行
 
 命令行适合已有脚本或只需运行一次处理的场景：
 
 ```powershell
-python -m galgame_news run "input/demo.docx" --issue demo --output "output/demo" --no-videos
+python -m galgame_news run "input/demo.docx" --issue demo --output "output" --no-videos
 ```
+
+`--output` 是任务输出根目录，不是本期任务目录。上例会在 `output/` 下新建
+类似 `demo-20261012T120000-a1b2c3d4/` 的独立任务文件夹，其中包含 SQLite
+任务状态、`raw/` 发布快照和 `final/` 图片交付。
 
 参数如下：
 
@@ -117,7 +121,7 @@ python -m galgame_news run "input/demo.docx" --issue demo --output "output/demo"
 | --- | --- | --- |
 | `input` | 是 | DOCX 输入文件路径，写在 `run` 后 |
 | `--issue` | 是 | 本期期号 |
-| `--output` | 否，但建议始终填写 | 显式指定输出目录，避免使用源码中的开发环境默认路径 |
+| `--output` | 否，但建议始终填写 | 指定任务输出根目录；每次运行都会在其中创建独立任务文件夹 |
 | `--offline` | 否 | 使用离线模式 |
 | `--no-videos` | 否 | 关闭视频发现和下载 |
 | `--config` | 否 | 指定配置文件路径 |

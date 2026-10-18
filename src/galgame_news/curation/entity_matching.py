@@ -13,6 +13,7 @@ import unicodedata
 from urllib.parse import unquote, urlsplit
 
 from ..domain import ImageCandidate, NewsItem, SourceType
+from ..discovery.goods_context import is_goods_news
 from .image_typing import _official_news_linked_gallery as _linked_gallery_evidence, _product_card_evidence
 
 
@@ -250,6 +251,20 @@ class EntityMatcher:
             value = candidate.signals.get(key)
             if value not in (None, False, "", 0):
                 conflicts.append(str(value) if value is not True else key)
+        goods_context = candidate.signals.get("goods_context") is True and is_goods_news(news)
+        goods_assoc = candidate.signals.get("goods_association")
+        if goods_context and conflicts:
+            return EntityMatchResult(False, 1.0, conflicting_entities=tuple(dict.fromkeys(conflicts)), supporting_signals=("explicit_goods_entity_conflict",), official_domain_match=official_domain_match)
+        from ..discovery.goods_context import has_item_evidence
+        goods_evidence = has_item_evidence(candidate)
+        if goods_context and goods_assoc == "matched" and goods_evidence:
+            return EntityMatchResult(True, 0.96, matched_entities=(str(candidate.signals.get("goods_item_id")),), supporting_signals=("goods_item_match",), official_domain_match=official_domain_match)
+        if goods_context and goods_assoc == "matched":
+            return EntityMatchResult(None, 0.0, supporting_signals=("goods_item_evidence_missing",), official_domain_match=official_domain_match)
+        if goods_context and goods_assoc == "conflict":
+            return EntityMatchResult(False, 1.0, conflicting_entities=(str(candidate.signals.get("goods_association_reason") or "goods_association_conflict"),), supporting_signals=("goods_association_conflict",), official_domain_match=official_domain_match)
+        if goods_context and goods_assoc == "uncertain":
+            return EntityMatchResult(None, 0.0, supporting_signals=("goods_association_uncertain",), official_domain_match=official_domain_match)
         if candidate.signals.get("brand_match") is False:
             conflicts.append("brand_mismatch")
         host_text = _compact(candidate_domain)

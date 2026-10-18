@@ -224,3 +224,107 @@ def test_playlist_is_never_downloaded(tmp_path):
     assert downloaded[0].status is VideoStatus.SKIPPED
     assert failures[0].code == "playlist_not_allowed"
     assert calls[0]["noplaylist"] is True
+
+
+def test_selected_short_is_not_rejected_due_to_unused_portrait_formats(tmp_path):
+    candidate = make_candidate(url="https://www.youtube.com/watch?v=AVxfuTX-f8M")
+    factory, _ = make_factory(make_info(
+        width=1080, height=1920, filesize=None,
+        requested_formats=[{"width": 608, "height": 1080, "vcodec": "vp9", "filesize": 16},
+                           {"vcodec": "none", "filesize": 4}],
+        formats=[{"width": 1080, "height": 1920}, {"height": 2160}],
+    ))
+    values, failures = VideoDownloader(backend_factory=factory, ffmpeg_detector=lambda: True).download([candidate], tmp_path)
+    assert not failures
+    assert values[0].status is VideoStatus.DOWNLOADED
+    assert (values[0].width, values[0].height) == (608, 1080)
+
+
+def test_selected_size_uses_one_estimate_not_top_level_plus_streams(tmp_path):
+    candidate = make_candidate(url="https://video.twimg.com/ext_tw_video/sample.mp4")
+    factory, _ = make_factory(make_info(
+        filesize=None, filesize_approx=100,
+        requested_formats=[{"height": 1080, "filesize": 80, "filesize_approx": 90},
+                           {"vcodec": "none", "filesize": 20}],
+    ))
+    values, failures = VideoDownloader(VideoConfig(max_file_bytes=100), backend_factory=factory,
+                                      ffmpeg_detector=lambda: True).download([candidate], tmp_path)
+    assert not failures and values[0].status is VideoStatus.DOWNLOADED
+
+
+def test_direct_x_allows_unknown_dimensions_then_checks_actual_media(tmp_path):
+    factory, calls = make_factory(make_info(width=None, height=None))
+    candidate = make_candidate(url="https://video.twimg.com/tweet_video/example.mp4")
+    values, failures = VideoDownloader(
+        backend_factory=factory, ffmpeg_detector=lambda: False,
+        media_probe=lambda path: {"width": 1280, "height": 720, "duration_seconds": 2},
+    ).download([candidate], tmp_path)
+    assert "height<=?1080" in calls[0]["format"]
+    assert not failures and values[0].status is VideoStatus.DOWNLOADED
+    assert (values[0].width, values[0].height) == (1280, 720)
+
+
+def test_default_backend_does_not_download_unverifiable_media_without_ffprobe(tmp_path, monkeypatch):
+    downloader = VideoDownloader(ffmpeg_detector=lambda: False)
+    monkeypatch.setattr(downloader, "_probe_executable", lambda: None)
+    monkeypatch.setattr(downloader, "backend_factory", lambda options: pytest.fail("must detect missing tool before download"))
+    values, failures = downloader.download([make_candidate()], tmp_path)
+    assert values[0].status is VideoStatus.FAILED
+    assert failures[0].code == "video_tools_missing" and failures[0].retryable
+    assert not list(tmp_path.rglob("*.mp4"))
+
+
+def test_failed_download_does_not_consume_news_limit_or_reuse_partial_file(tmp_path):
+    bad = make_candidate(url="https://video.example/bad")
+    good = make_candidate(url="https://video.example/good")
+
+    class PartialBackend(FakeBackend):
+        def download(self, urls):
+            if "bad" in urls[0]:
+                Path(self.options["outtmpl"]).with_suffix(".part").write_bytes(b"partial")
+                raise TimeoutError()
+            return super().download(urls)
+
+    values, failures = VideoDownloader(
+        VideoConfig(max_per_news=1), ffmpeg_detector=lambda: False,
+        backend_factory=lambda options: PartialBackend(options, make_info()),
+    ).download([bad, good], tmp_path)
+    assert values[0].failure_reason and "TimeoutError" in values[0].failure_reason
+    assert values[1].status is VideoStatus.DOWNLOADED
+    assert len(failures) == 1
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_download_uses_same_selected_metadata_when_backend_supports_it(tmp_path):
+    class SelectedBackend(FakeBackend):
+        def process_info(self, info):
+            assert info == self.current_info
+            return super().download(["selected-streams"])
+
+        def download(self, urls):
+            raise AssertionError("do not extract the URL a second time")
+
+    values, failures = VideoDownloader(
+        backend_factory=lambda options: SelectedBackend(options, make_info()), ffmpeg_detector=lambda: False,
+    ).download([make_candidate()], tmp_path)
+    assert not failures and values[0].status is VideoStatus.DOWNLOADED
+
+
+def test_probe_updates_actual_metadata_and_failed_probe_keeps_original_url(tmp_path):
+    candidate = make_candidate()
+    factory, _ = make_factory(make_info())
+    values, failures = VideoDownloader(
+        backend_factory=factory, ffmpeg_detector=lambda: False,
+        media_probe=lambda path: {"width": 640, "height": 360, "duration_seconds": 1.0},
+    ).download([candidate], tmp_path)
+    assert not failures
+    assert (values[0].width, values[0].height, values[0].duration_seconds) == (640, 360, 1.0)
+
+    def invalid(path):
+        raise ValueError("video validation failed (ValueError)")
+
+    values, failures = VideoDownloader(backend_factory=factory, ffmpeg_detector=lambda: False,
+                                      media_probe=invalid).download([candidate], tmp_path / "invalid")
+    assert values[0].status is VideoStatus.FAILED and values[0].video_url == candidate.video_url
+    assert failures[0].code == "invalid_video" and not failures[0].retryable
+    assert not list((tmp_path / "invalid").rglob("*.mp4"))

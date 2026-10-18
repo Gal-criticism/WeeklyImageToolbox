@@ -127,11 +127,23 @@ def write_checkpoint(
     validate_checkpoint_associations(checkpoint)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    atomic_json_write(destination, checkpoint.model_dump(mode="json"))
+    from ..tasks.repository import TaskRepository
+    if destination.suffix == ".sqlite3" or TaskRepository.is_authoritative(destination.parent):
+        TaskRepository(destination.parent).save_checkpoint(checkpoint.model_dump(mode="json"))
+    else:
+        atomic_json_write(destination, checkpoint.model_dump(mode="json"))
 
 
 def load_checkpoint(path: Path | str) -> Checkpoint:
-    return Checkpoint.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
+    from ..tasks.repository import TaskRepository
+    source = Path(path)
+    if source.suffix == ".sqlite3" or TaskRepository.is_authoritative(source.parent):
+        payload = TaskRepository(source.parent, create=False).load_checkpoint()
+        if payload is None:
+            raise ValueError("SQLite 检查点缺失，已保留数据库，请检查或恢复任务备份")
+    else:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    return Checkpoint.model_validate(payload)
 
 
 def validate_checkpoint(checkpoint, request, input_hash, config_hash_value, task_id, *, schema_version: int = CHECKPOINT_SCHEMA_VERSION) -> None:

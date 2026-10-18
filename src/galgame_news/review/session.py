@@ -172,6 +172,7 @@ class ReviewSession:
         self.output_dir = output_dir
         self.task_root = task_root or state_path.parent
         self.retry_root: Path | None = None
+        self.legacy_retry_roots: tuple[Path, ...] = ()
         self.state_path = state_path
         self.images = images
         self.videos = videos
@@ -185,6 +186,7 @@ class ReviewSession:
         self._manual_decisions: set[str] = set()
         self._image_by_id = {str(item.id): item for item in images}
         self._video_by_id = {str(item.id): item for item in videos}
+        self._repository_candidate_ids = set(self._image_by_id) | set(self._video_by_id)
         self.revision = 0
         self._pending_cache: dict[str, tuple[tuple[Any, ...], tuple[ImageCandidate, ...]]] = {}
         self._loaded_state_payload: dict[str, Any] = {"schema_version": 1, "decisions": {}, "manual_decisions": []}
@@ -208,9 +210,16 @@ class ReviewSession:
             # A sibling path is important for imported legacy output: setting a
             # decision must never create a file inside the legacy directory.
             state = root.parent / f".{root.name}.review_state.json"
-
-        image_payload = cls._read_required_json(root / "image_index.json") if (root / "image_index.json").exists() else {}
-        video_payload = cls._read_required_json(root / "video_index.json") if (root / "video_index.json").exists() else {}
+        from ..tasks.repository import TaskRepository
+        db_root = root.parent if root.name.casefold() == "raw" else root
+        repository = TaskRepository(db_root, create=False) if TaskRepository.is_authoritative(db_root) else None
+        if repository is not None:
+            image_payload, video_payload, review_payload, failed_payload = repository.export_review_payloads()
+            state = repository.path
+            managed_root = db_root
+        else:
+            image_payload = cls._read_required_json(root / "image_index.json") if (root / "image_index.json").exists() else {}
+            video_payload = cls._read_required_json(root / "video_index.json") if (root / "video_index.json").exists() else {}
         if not image_payload and not video_payload:
             raise ValueError("审核索引为空或无法读取，请重新选择有效的任务结果目录。")
         for payload, name, fields in ((image_payload, "图片", ("candidates", "images", "image_candidates")),
@@ -221,8 +230,9 @@ class ReviewSession:
                 for key in (*fields, "news_items", "items"):
                     if key in payload and not isinstance(payload[key], list):
                         raise ValueError(f"{name}主索引的 {key} 字段损坏，应为列表，已保留原文件")
-        review_payload = cls._read_required_json(root / "review_required.json") if (root / "review_required.json").exists() else []
-        failed_payload = _read_json(root / "failed_items.json", [])
+        if repository is None:
+            review_payload = cls._read_required_json(root / "review_required.json") if (root / "review_required.json").exists() else []
+            failed_payload = _read_json(root / "failed_items.json", [])
         image_items = _items(image_payload, ("candidates", "images", "image_candidates"))
         video_items = _items(video_payload, ("videos", "video_candidates", "candidates"))
         news_items = cls._news_items(image_payload, video_payload, image_items, video_items)
@@ -537,8 +547,14 @@ class ReviewSession:
                 except ValueError:
                     continue
         # Persist initial state so a fresh task has a durable review contract.
-        # Initial defaults are persisted only for a new state file.
-        if not self.state_path.exists():
+        # The SQLite file also contains pipeline state and can exist before
+        # the first review decision has been saved.
+        if self.state_path.suffix == ".sqlite3":
+            from ..tasks.repository import TaskRepository
+            missing_state = TaskRepository(self.state_path.parent, create=False).load_review_state() is None
+        else:
+            missing_state = not self.state_path.exists()
+        if missing_state:
             self._persist()
 
     def _usable(self, candidate: ImageCandidate | VideoCandidate) -> bool:
@@ -571,6 +587,9 @@ class ReviewSession:
         return self._read_state_payload().get("decisions", {})
 
     def _read_state_payload(self) -> dict[str, Any]:
+        if self.state_path.suffix == ".sqlite3":
+            from ..tasks.repository import TaskRepository
+            return TaskRepository(self.state_path.parent, create=False).load_review_state() or {"schema_version": 1, "decisions": {}, "manual_decisions": []}
         if not self.state_path.exists():
             return {"schema_version": 1, "decisions": {}, "manual_decisions": []}
         payload = self._read_required_json(self.state_path)
@@ -612,6 +631,10 @@ class ReviewSession:
     @staticmethod
     def persist_state_payload(path: Path | str, payload: dict[str, Any]) -> None:
         path = Path(path)
+        if path.suffix == ".sqlite3":
+            from ..tasks.repository import TaskRepository
+            TaskRepository(path.parent, create=False).save_review_state(payload)
+            return
         # A corrupted state must never be replaced by an empty/default snapshot.
         # This check runs in the writer thread for desktop callers.
         if path.exists():
@@ -652,6 +675,39 @@ class ReviewSession:
 
     def decision(self, media_id: str) -> ReviewDecision:
         return self._decisions.get(str(media_id), ReviewDecision.REJECTED)
+
+    def scope_repository_query(self, news_id: str | None, allowed_news: set[str] | None = None) -> None:
+        """Narrow a worker-owned snapshot using bounded database reads.
+
+        Decisions and candidate objects remain those captured by the GUI, so
+        a background fetch never replaces an unsaved human decision. New rows
+        written by a grab operation become visible only after its delta merge.
+        Legacy snapshots keep their existing in-memory query behavior.
+        """
+        if self.state_path.suffix != ".sqlite3":
+            return
+        from ..tasks.repository import TaskRepository
+        repository = TaskRepository(self.state_path.parent, create=False)
+        targets = ([news_id] if news_id is not None
+                   else sorted(allowed_news) if allowed_news is not None else [None])
+        identifiers: dict[str, set[str]] = {"image": set(), "video": set()}
+        for kind in identifiers:
+            for target in targets:
+                if allowed_news is not None and target is not None and target not in allowed_news:
+                    continue
+                identifiers[kind].update(str(value) for value in repository.iter_candidate_ids(
+                    news_id=target, kind=kind, batch_size=100))
+        def included(candidate, kind):
+            if news_id is not None and candidate.news_id != news_id:
+                return False
+            if allowed_news is not None and candidate.news_id not in allowed_news:
+                return False
+            # Imported legacy batches may still live in the explicitly bound
+            # private retry directory. Keep their merged snapshot candidates.
+            return (str(candidate.id) in identifiers[kind]
+                    or str(candidate.id) not in self._repository_candidate_ids)
+        self.images = [candidate for candidate in self.images if included(candidate, "image")]
+        self.videos = [candidate for candidate in self.videos if included(candidate, "video")]
 
     def set_decision(self, media_id: str, decision: ReviewDecision | str) -> None:
         self.set_decisions([media_id], decision)
@@ -757,7 +813,23 @@ class ReviewSession:
         """Read, validate and decode a retry attempt without changing this session."""
         news_id, attempt_id = str(news_id), str(attempt_id)
         root = self._confined_retry_path(news_id, attempt_id)
-        if not root.is_dir():
+        from ..tasks.repository import TaskRepository
+        repository = (TaskRepository(self.task_root, create=False)
+                      if self.task_root is not None and TaskRepository.is_authoritative(self.task_root) else None)
+        batch = repository.read_batch(news_id, attempt_id) if repository is not None else None
+        if batch is None and legacy_attempt is not None and getattr(legacy_attempt, "path", None):
+            proposed = Path(legacy_attempt.path).resolve()
+            for legacy_root in self.legacy_retry_roots:
+                confined_root = Path(legacy_root).resolve()
+                expected = (confined_root / news_id / attempt_id).resolve()
+                try:
+                    expected.relative_to(confined_root)
+                except ValueError:
+                    continue
+                if proposed == expected:
+                    root = expected
+                    break
+        if batch is None and not root.is_dir():
             raise FileNotFoundError(root)
         from ..diagnostics import diagnose_error
         diagnostics: list[Any] = []
@@ -765,10 +837,10 @@ class ReviewSession:
             # Older synchronous callers supplied a validated RetryAttempt in
             # memory. Preserve that interface; a present manifest always wins
             # and a corrupt file must never be bypassed by an in-memory copy.
-            image_payload = (self._read_required_json(root / "image_index.json")
+            image_payload = dict(batch, candidates=batch["images"]) if batch else (self._read_required_json(root / "image_index.json")
                              if (root / "image_index.json").exists() or legacy_attempt is None
                              else {"candidates": legacy_attempt.images})
-            video_payload = (self._read_required_json(root / "video_index.json") if (root / "video_index.json").exists()
+            video_payload = {"videos": batch["videos"]} if batch else (self._read_required_json(root / "video_index.json") if (root / "video_index.json").exists()
                              else {"videos": legacy_attempt.videos if legacy_attempt is not None else []})
         except ValueError as exc:
             raise ValueError(f"补抓批次索引损坏：{exc}") from exc
@@ -805,7 +877,9 @@ class ReviewSession:
                 continue
             source = self._confine_retry_asset(self._resolve_image_path(candidate, root))
             if source is not None:
-                expected = candidate.output_sha256 or candidate.sha256
+                expected = (candidate.original_sha256 or candidate.sha256
+                            if candidate.original_path and source == Path(candidate.original_path).resolve()
+                            else candidate.output_sha256 or candidate.sha256)
                 try:
                     if expected and hashlib.sha256(source.read_bytes()).hexdigest().casefold() != str(expected).casefold():
                         raise ValueError("hash mismatch")
@@ -852,6 +926,8 @@ class ReviewSession:
                 diagnostics.append(diagnose_error(exc, stage="读取批次失败记录", source=str(failure_path)))
                 failure_payload = []
         failures = tuple(_items(failure_payload, ("failures",)))
+        if batch is not None:
+            failures = tuple(batch.get("failures", []))
         if legacy_attempt is not None and not (root / "failed_items.json").exists():
             failures = tuple(legacy_attempt.failures)
         metadata = image_payload if isinstance(image_payload, dict) else {}
@@ -965,10 +1041,15 @@ class ReviewSession:
             return None
         try:
             resolved = source.resolve()
-            resolved.relative_to(asset_root)
-        except (OSError, ValueError):
+        except OSError:
             return None
-        return resolved
+        for allowed_root in (asset_root, *self.legacy_retry_roots):
+            try:
+                resolved.relative_to(Path(allowed_root).resolve())
+                return resolved
+            except ValueError:
+                continue
+        return None
 
     def _folder_names(self) -> dict[str, str]:
         # Use the same canonical naming policy as raw output.  Manifest order
@@ -1026,7 +1107,7 @@ class ReviewSession:
         except Exception:
             return None
 
-    def export_final(self) -> dict[str, Any]:
+    def export_final(self, *, include_pending: bool = True) -> dict[str, Any]:
         final_root = self.task_root / "final"
         final_root.mkdir(parents=True, exist_ok=True)
         published = final_root / "images"
@@ -1052,7 +1133,7 @@ class ReviewSession:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(source, target)
         try:
-            manifest = self._export_images_and_videos(image_root)
+            manifest = self._export_images_and_videos(image_root, include_pending=include_pending)
             if published.exists():
                 try:
                     atomic_replace(published, backup)
@@ -1061,6 +1142,15 @@ class ReviewSession:
                     # when individual files can still be replaced safely.
                     self._publish_files_in_place(image_root, published, backup, owned, manifest)
                     committed = True
+                    if not include_pending:
+                        # In-place publishing removes old managed files, but
+                        # can leave their now-empty pending directories behind.
+                        pending_dirs = {Path(value).parent for value in owned if Path(value).parent.name == "未候选"}
+                        for relative in pending_dirs:
+                            try:
+                                (final_root / relative).rmdir()
+                            except OSError:
+                                pass  # Preserve user-added files or occupied directories.
                     return manifest
             try:
                 atomic_replace(image_root, published)
@@ -1164,13 +1254,13 @@ class ReviewSession:
                 raise PermissionError("图片文件被占用或无写入权限。原有图片已恢复，请关闭预览/图片编辑程序后重试导出。") from error
             raise
 
-    def _export_images_and_videos(self, image_root: Path) -> dict[str, Any]:
+    def _export_images_and_videos(self, image_root: Path, *, include_pending: bool = True) -> dict[str, Any]:
         folder_names = self._folder_names()
         files: list[str] = []
         image_ranks: dict[str, int] = {}
         pending_ranks: dict[str, int] = {}
         selected_count = pending_count = video_count = 0
-        for candidate in [*self.accepted_images(), *self.pending_images()]:
+        for candidate in [*self.accepted_images(), *(self.pending_images() if include_pending else [])]:
             decision = self.decision(str(candidate.id))
             if self._hard_filtered(candidate):
                 continue
@@ -1232,6 +1322,9 @@ class ReviewSession:
         return manifest
 
     def _issue_id(self) -> str:
+        if self.state_path.suffix == ".sqlite3":
+            from ..tasks.repository import TaskRepository
+            return str(TaskRepository(self.task_root, create=False).get_meta("issue_id", ""))
         for candidate in [self.output_dir / "image_index.json", self.output_dir / "video_index.json"]:
             payload = _read_json(candidate, {})
             if isinstance(payload, dict) and payload.get("issue_id") is not None:

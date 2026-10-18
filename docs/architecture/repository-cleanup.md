@@ -4,8 +4,11 @@ The maintained implementation lives in `src/galgame_news/` and is launched
 with the module CLI:
 
 ```powershell
-python -m galgame_news run INPUT.docx --issue ISSUE --output output/ISSUE
+python -m galgame_news run INPUT.docx --issue ISSUE --output output
 ```
+
+`--output` names the root that contains per-run task folders, not an issue's
+direct output directory.
 
 The production flow is intentionally layered:
 

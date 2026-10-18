@@ -23,6 +23,7 @@ _WORD_NAMESPACE = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main
 @dataclass(frozen=True)
 class _ParagraphInfo:
     text: str
+    hyperlink_urls: tuple[str, ...]
     all_runs_bold: bool
     font_sizes: frozenset[int]
 
@@ -31,6 +32,10 @@ def _paragraph_infos(path: Path | str) -> list[_ParagraphInfo]:
     try:
         with zipfile.ZipFile(path) as archive:
             xml = archive.read("word/document.xml")
+            try:
+                rels_root = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+            except KeyError:
+                rels_root = None
     except (OSError, zipfile.BadZipFile, KeyError) as exc:
         raise ValueError(f"无法读取 DOCX：{exc}") from exc
     try:
@@ -38,9 +43,25 @@ def _paragraph_infos(path: Path | str) -> list[_ParagraphInfo]:
     except ET.ParseError as exc:
         raise ValueError(f"DOCX XML 无效：{exc}") from exc
 
+    relationships = {}
+    if rels_root is not None:
+        relationships = {rel.get("Id"): rel.get("Target", "") for rel in rels_root}
     paragraphs: list[_ParagraphInfo] = []
     for paragraph in root.iter(_WORD_NAMESPACE + "p"):
-        text = "".join(node.text or "" for node in paragraph.iter(_WORD_NAMESPACE + "t"))
+        pieces: list[str] = []
+        hyperlink_urls: list[str] = []
+        for node in paragraph.iter():
+            if node.tag == _WORD_NAMESPACE + "t":
+                pieces.append(node.text or "")
+            elif node.tag == _WORD_NAMESPACE + "tab":
+                pieces.append("\t")
+            elif node.tag in {_WORD_NAMESPACE + "br", _WORD_NAMESPACE + "cr"}:
+                pieces.append("\n")
+            elif node.tag == _WORD_NAMESPACE + "hyperlink":
+                target = relationships.get(node.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"), "")
+                if target.lower().startswith(("http://", "https://")):
+                    hyperlink_urls.append(target)
+        text = "".join(pieces)
         text = text.strip()
         if not text:
             continue
@@ -67,6 +88,7 @@ def _paragraph_infos(path: Path | str) -> list[_ParagraphInfo]:
         paragraphs.append(
             _ParagraphInfo(
                 text=text,
+                hyperlink_urls=tuple(hyperlink_urls),
                 all_runs_bold=bool(runs) and all(bold for bold, _ in runs),
                 font_sizes=frozenset(size for _, size in runs if size is not None),
             )
@@ -79,13 +101,20 @@ def parse_docx_paragraphs(path: Path | str) -> list[str]:
 
 
 def split_urls(text: str) -> list[str]:
-    starts = [match.start() for match in URL_RE.finditer(text)]
+    # Keep literal schemes used as query values (for example lurl=https://...),
+    # while recognizing pasted URLs even when they touch the preceding URL.
+    starts = [
+        match.start()
+        for match in re.finditer(r"https?://", text, re.IGNORECASE)
+        if match.start() == 0 or text[match.start() - 1] != "="
+    ]
     if not starts:
         return []
     result: list[str] = []
     for index, start in enumerate(starts):
         end = starts[index + 1] if index + 1 < len(starts) else len(text)
-        value = text[start:end].strip().rstrip("，。；;、)]】")
+        value = text[start:end].strip()
+        value = re.split(r"[\s，。；;、！？]", value, maxsplit=1)[0].rstrip(")]】")
         if value:
             result.append(value)
     return result
@@ -169,6 +198,7 @@ class DocxDocumentParser:
                 continue
             current["body"] = f"{current['body']}\n{line}".strip()
             current["source_urls"].extend(split_urls(line))
+            current["source_urls"].extend(paragraph.hyperlink_urls)
         if current:
             entries.append(NewsDraft(**current))
         for entry in entries:
