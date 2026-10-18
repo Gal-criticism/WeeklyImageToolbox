@@ -129,14 +129,16 @@ def lock_database():
 threading.Thread(target=lock_database, daemon=False).start()
 assert locked.wait(5)
 window.show()
-(root / "ready.json").write_text(json.dumps({"child": descendant.pid, "grandchild": grandchild_pid,
+(root / "ready.tmp").write_text(json.dumps({"child": descendant.pid, "grandchild": grandchild_pid,
     "job": owner._job is not None}), encoding="utf-8")
+(root / "ready.tmp").replace(root / "ready.json")
 timer = QTimer()
 def trigger():
     if (root / "exit").exists():
         timer.stop()
         # Measure the confirmed exit handler, not first-paint/startup latency.
-        (root / "exit-started").write_text(str(time.monotonic()), encoding="ascii")
+        (root / "exit-started.tmp").write_text(str(time.monotonic()), encoding="ascii")
+        (root / "exit-started.tmp").replace(root / "exit-started")
         window.close()
 timer.timeout.connect(trigger)
 timer.start(10)
