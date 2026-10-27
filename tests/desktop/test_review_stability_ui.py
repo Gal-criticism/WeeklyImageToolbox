@@ -5,7 +5,6 @@ import time
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import Qt
 
 from galgame_news.desktop.review_page import ReviewPage
 from galgame_news.review import ReviewDecision, ReviewSession
@@ -111,7 +110,7 @@ def test_async_video_rows_keep_local_playback_entry(qtbot, tmp_path, monkeypatch
     page = ReviewPage()
     qtbot.addWidget(page)
     page.set_session(session)
-    page.tabs.setCurrentIndex(3)
+    page.tabs.setCurrentIndex(4)
     _wait_loaded(qtbot, page, 1)
     page.media_list.setCurrentRow(0)
     assert page.play_button.isEnabled()

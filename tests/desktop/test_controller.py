@@ -79,6 +79,8 @@ def test_controller_persists_real_task_dir_and_resume_uses_it(qtbot, tmp_path: P
         issue_id="issue",
         output_dir=output_dir,
         use_socialdata_x=True,
+        use_archive_materials=True,
+        archive_range="all",
         selected_sections=["x", "z"],
     ) is True
     running_record = controller.task_store.active_task
@@ -90,12 +92,15 @@ def test_controller_persists_real_task_dir_and_resume_uses_it(qtbot, tmp_path: P
     assert completed_record is not None
     assert Path(completed_record.task_root) == real_task
     assert controller.task_store.load_request_options(completed_record)["selected_sections"] == ["x", "z"]
+    assert controller.task_store.load_request_options(completed_record)["archive_range"] == "all"
     assert requests[0].images_only is False
 
     assert controller.resume_task(completed_record) is True
     qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
     assert requests[1].resume is True
     assert requests[1].use_socialdata_x is True
+    assert requests[1].use_archive_materials is True
+    assert requests[1].archive_range == "all"
     assert requests[1].selected_sections == ["x", "z"]
     assert Path(requests[1].task_dir) == real_task
     assert Path(requests[1].output_dir) == output_dir
@@ -149,6 +154,7 @@ def test_controller_old_request_options_resume_with_all_sections(qtbot, tmp_path
     assert requests[0].resume is True
     assert requests[0].selected_sections == ["x", "h", "z"]
     assert requests[0].images_only is False
+    assert requests[0].archive_range == "year"
 
 
 def test_task_request_legacy_images_only_flag_is_read_but_ignored(tmp_path: Path):

@@ -33,6 +33,11 @@ EXCLUDED_OPTIONAL_MODULES = [
     "nbformat",
     "matplotlib",
     "numpy",
+    # Optional local CLIP analysis is outside the base desktop runtime.
+    "open_clip",
+    "torch",
+    "torchvision",
+    "torchaudio",
 ]
 
 

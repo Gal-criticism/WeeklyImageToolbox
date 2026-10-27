@@ -6,7 +6,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def drain_desktop_work(monkeypatch, request):
-    if "desktop" not in request.node.path.parts and request.node.path.name != "test_desktop_toolbox.py":
+    if "desktop" not in request.node.path.parts and request.node.path.name not in {"test_desktop_toolbox.py", "test_archive_module.py"}:
         yield
         return
     qtbot = request.getfixturevalue("qtbot")

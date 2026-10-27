@@ -14,10 +14,11 @@ from .credentials import (
 )
 from .ffmpeg import FFmpegStatus, discover_ffmpeg, resolve_ffmpeg, resolve_ffmpeg_location
 from .browser import PLAYWRIGHT_VERSION, browser_install_commands, check_browser_runtime
-from .model import AppSettings, SettingsStore, default_app_data_dir
+from .model import ArchiveSettings, AppSettings, SettingsStore, default_app_data_dir
 
 __all__ = [
     "AppSettings",
+    "ArchiveSettings",
     "PLAYWRIGHT_VERSION",
     "CredentialBackend",
     "CredentialBundle",

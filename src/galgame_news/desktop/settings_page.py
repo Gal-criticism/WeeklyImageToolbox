@@ -16,12 +16,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 from .ui import page_header
 
 from ..settings import (
+    ArchiveSettings,
     AppSettings,
     CredentialStore,
     InMemoryCredentialBackend,
@@ -35,6 +37,8 @@ from ..settings import (
 class SettingsPage(QWidget):
     theme_changed = Signal(str)
     ffmpeg_checked = Signal(object)
+    archive_connection_test_requested = Signal(object)
+    archive_index_update_requested = Signal(object)
 
     def __init__(
         self,
@@ -65,6 +69,23 @@ class SettingsPage(QWidget):
         self.theme_combo.setCurrentIndex(max(0, self.theme_combo.findData(self._settings.theme)))
         self.socialdata_edit = QLineEdit()
         self.socialdata_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        archive = self._settings.archive
+        self.archive_server_edit = QLineEdit(archive.server_url)
+        self.archive_username_edit = QLineEdit(archive.username)
+        self.archive_password_edit = QLineEdit()
+        self.archive_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.archive_password_edit.setPlaceholderText("留空保留已有口令")
+        self.archive_root_edit = QLineEdit(archive.root_path)
+        self.archive_local_roots_edit = QLineEdit("; ".join(archive.local_roots))
+        self.archive_range_days_spin = QSpinBox()
+        self.archive_range_days_spin.setRange(1, 36500)
+        self.archive_range_days_spin.setValue(archive.range_days)
+        self.archive_status = QLabel("尚未检查")
+        self.archive_status.setWordWrap(True)
+        self.archive_test_button = QPushButton("测试连接")
+        self.archive_index_button = QPushButton("更新索引")
+        self.archive_test_button.clicked.connect(self.test_archive_connection)
+        self.archive_index_button.clicked.connect(self.request_archive_index_update)
         self.save_button = QPushButton("保存设置")
         self.save_button.setProperty("primary", True)
         self.save_button.clicked.connect(self._save_from_ui)
@@ -104,6 +125,23 @@ class SettingsPage(QWidget):
         hint.setOpenExternalLinks(True)
         secret_form.addRow(hint)
         self._refresh_credential_status()
+        archive_group = QGroupBox("往期周报素材库")
+        archive_form = QFormLayout(archive_group)
+        archive_form.addRow("Nextcloud 地址", self.archive_server_edit)
+        archive_form.addRow("用户名", self.archive_username_edit)
+        archive_form.addRow("应用口令", self.archive_password_edit)
+        archive_form.addRow("周报目录", self.archive_root_edit)
+        archive_form.addRow("本地历史目录（分号分隔）", self.archive_local_roots_edit)
+        archive_form.addRow("索引范围（天）", self.archive_range_days_spin)
+        archive_actions = QHBoxLayout()
+        archive_actions.addWidget(self.archive_status, 1)
+        archive_actions.addWidget(self.archive_test_button)
+        archive_actions.addWidget(self.archive_index_button)
+        archive_form.addRow(archive_actions)
+        archive_hint = QLabel("账户口令保存在本机凭据库；普通设置文件只保存地址、目录和索引范围。索引更新不会批量下载原件。")
+        archive_hint.setWordWrap(True)
+        archive_hint.setObjectName("muted")
+        archive_form.addRow(archive_hint)
         ffmpeg = QGroupBox("视频工具")
         ffmpeg_layout = QVBoxLayout(ffmpeg)
         check_row = QHBoxLayout()
@@ -143,7 +181,7 @@ class SettingsPage(QWidget):
         content = QWidget()
         groups = QVBoxLayout(content)
         groups.setContentsMargins(0, 0, 6, 0)
-        for group in (appearance, destination, secrets, ffmpeg, browser):
+        for group in (appearance, destination, secrets, archive_group, ffmpeg, browser):
             groups.addWidget(group)
         groups.addStretch()
         scroll = QScrollArea()
@@ -194,11 +232,19 @@ class SettingsPage(QWidget):
             "default_output_path": Path(self.output_edit.text()),
             "theme": theme,
             "browser_enabled": self.browser_enabled_checkbox.isChecked(),
+            "archive": {
+                "server_url": self.archive_server_edit.text().strip(),
+                "username": self.archive_username_edit.text().strip(),
+                "root_path": self.archive_root_edit.text().strip(),
+                "local_roots": [value.strip() for value in self.archive_local_roots_edit.text().split(";") if value.strip()],
+                "range_days": self.archive_range_days_spin.value(),
+            },
         })
         settings = AppSettings.model_validate(values)
         self.settings_store.save(settings)
         self._settings = settings
-        for name, edit in self._credential_fields.items():
+        credential_fields = {**self._credential_fields, "archive_app_password": self.archive_password_edit}
+        for name, edit in credential_fields.items():
             if edit.text():
                 self.credential_store.set(name, edit.text())
                 edit.clear()
@@ -212,6 +258,32 @@ class SettingsPage(QWidget):
         self.browser_status.setText(status.message)
         self.browser_install_button.setEnabled(not status.available)
         return status
+
+    def _archive_settings_payload(self):
+        return ArchiveSettings(
+            server_url=self.archive_server_edit.text().strip(),
+            username=self.archive_username_edit.text().strip(),
+            root_path=self.archive_root_edit.text().strip(),
+            local_roots=[value.strip() for value in self.archive_local_roots_edit.text().split(";") if value.strip()],
+            range_days=self.archive_range_days_spin.value(),
+        )
+
+    def test_archive_connection(self) -> None:
+        self._store_archive_password()
+        self.archive_connection_test_requested.emit(self._archive_settings_payload())
+
+    def request_archive_index_update(self) -> None:
+        self._store_archive_password()
+        self.archive_index_update_requested.emit(self._archive_settings_payload())
+
+    def _store_archive_password(self) -> None:
+        password = self.archive_password_edit.text()
+        if password:
+            self.credential_store.set("archive_app_password", password)
+            self.archive_password_edit.clear()
+
+    def set_archive_status(self, message: str) -> None:
+        self.archive_status.setText(str(message or ""))
 
     def install_browser(self) -> None:
         if self._browser_process.state() != QProcess.ProcessState.NotRunning:

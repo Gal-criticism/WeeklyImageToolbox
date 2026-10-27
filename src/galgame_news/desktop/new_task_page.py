@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal, Qt, QEvent
+from PySide6.QtCore import Signal, QEvent
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -59,6 +60,33 @@ class NewTaskPage(QWidget):
         self.socialdata_checkbox = QCheckBox("本次使用 X 图片与视频 API（SocialData）")
         self.socialdata_checkbox.setToolTip("默认关闭；启用后按帖子查询，密钥从凭据库读取。")
         self.socialdata_checkbox.setObjectName("useSocialDataXCheckbox")
+        self.archive_materials_checkbox = QCheckBox("往期周报素材检索")
+        self.archive_materials_checkbox.setObjectName("useArchiveMaterialsCheckbox")
+        self.archive_materials_checkbox.setToolTip("默认关闭；启用后优先匹配更早期号的历史图片和视频。")
+        self.archive_range_combo = QComboBox()
+        self.archive_range_combo.setObjectName("archiveRangeCombo")
+        self.archive_range_combo.addItem("最近一年", "year")
+        self.archive_range_combo.addItem("全部周报", "all")
+        archive_range_row = QWidget()
+        archive_range_layout = QHBoxLayout(archive_range_row)
+        archive_range_layout.setContentsMargins(20, 0, 0, 0)
+        archive_range_layout.addWidget(QLabel("检索范围"))
+        archive_range_layout.addWidget(self.archive_range_combo)
+        archive_range_layout.addStretch()
+        archive_range_hint = QLabel("返回作品最近出现的两期全部匹配图片与视频。")
+        archive_range_hint.setObjectName("muted")
+        archive_range_hint.setWordWrap(True)
+        self.archive_range_hint = archive_range_hint
+        archive_range_container = QWidget()
+        archive_range_container.setObjectName("archiveRangeOptions")
+        archive_range_container_layout = QVBoxLayout(archive_range_container)
+        archive_range_container_layout.setContentsMargins(0, 0, 0, 0)
+        archive_range_container_layout.setSpacing(4)
+        archive_range_container_layout.addWidget(archive_range_row)
+        archive_range_container_layout.addWidget(archive_range_hint)
+        archive_range_container.hide()
+        self.archive_range_container = archive_range_container
+        self.archive_materials_checkbox.toggled.connect(archive_range_container.setVisible)
         self.section_checkboxes = {
             "x": QCheckBox("新作"),
             "h": QCheckBox("汉化"),
@@ -107,6 +135,8 @@ class NewTaskPage(QWidget):
         options_layout.addWidget(self.no_videos_checkbox)
         options_layout.addWidget(self.offline_checkbox)
         options_layout.addWidget(self.socialdata_checkbox)
+        options_layout.addWidget(self.archive_materials_checkbox)
+        options_layout.addWidget(archive_range_container)
         notice = QLabel("任务完成后保留完整输出：raw、索引、检查点、缓存、审核状态与 final 图片交付，便于审核和恢复。")
         notice.setObjectName("muted")
         notice.setWordWrap(True)
@@ -174,6 +204,8 @@ class NewTaskPage(QWidget):
             "offline": self.offline_checkbox.isChecked(),
             "no_videos": self.no_videos_checkbox.isChecked(),
             "use_socialdata_x": self.socialdata_checkbox.isChecked(),
+            "use_archive_materials": self.archive_materials_checkbox.isChecked(),
+            "archive_range": self.archive_range_combo.currentData(),
             "selected_sections": selected_sections,
         }
         if not payload["input_path"].name or not payload["issue_id"]:

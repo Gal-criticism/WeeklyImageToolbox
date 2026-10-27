@@ -163,8 +163,12 @@ class TaskRequest:
     # Deprecated compatibility field: older serialized requests may still
     # supply it, but a request can no longer opt into deleting task internals.
     images_only: bool = False
+    use_archive_materials: bool = False
+    archive_range: Literal["year", "all"] = "year"
 
     def __post_init__(self) -> None:
+        if self.archive_range not in ("year", "all"):
+            raise ValueError("往期周报范围仅支持最近一年或全部周报")
         if not isinstance(self.selected_sections, (list, tuple, set, frozenset)):
             raise ValueError("抓取栏目必须是新作、汉化、周边的选择列表")
         if not self.selected_sections:

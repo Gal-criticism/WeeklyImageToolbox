@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -272,6 +273,26 @@ def test_default_backend_does_not_download_unverifiable_media_without_ffprobe(tm
     assert values[0].status is VideoStatus.FAILED
     assert failures[0].code == "video_tools_missing" and failures[0].retryable
     assert not list(tmp_path.rglob("*.mp4"))
+
+
+def test_default_media_probe_preserves_ffprobe_container_name(tmp_path, monkeypatch):
+    import galgame_news.video.downloader as downloader_module
+
+    downloader = VideoDownloader()
+    monkeypatch.setattr(downloader, "_probe_executable", lambda: "ffprobe")
+    monkeypatch.setattr(
+        downloader_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout='{"streams":[{"codec_type":"video","width":1280,"height":720}],'
+                   '"format":{"duration":"12.5","format_name":"matroska,webm"}}',
+        ),
+    )
+
+    measured = downloader.media_probe(tmp_path / "clip.webm")
+
+    assert measured["format_name"] == "matroska,webm"
 
 
 def test_failed_download_does_not_consume_news_limit_or_reuse_partial_file(tmp_path):

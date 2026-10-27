@@ -68,7 +68,7 @@ def test_chinese_grid_and_news_filter_keep_tab_mapping(qtbot, tmp_path):
     page.set_session(session)
     wait_ready(qtbot, page)
     assert page.splitter.count() == 3
-    assert [page.tabs.tabText(index) for index in range(4)] == ["已选", "未候选／待复核", "已排除", "视频"]
+    assert [page.tabs.tabText(index) for index in range(5)] == ["已选", "未候选／待复核", "往期周报", "已排除", "视频"]
     assert page.media_list.viewMode() is page.media_list.ViewMode.IconMode
     assert page.media_list.selectionMode() is QAbstractItemView.SelectionMode.ExtendedSelection
     assert page.media_list.count() == 3

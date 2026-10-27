@@ -144,6 +144,13 @@ def video_candidate_id_for(video_url: str) -> str:
     return hashlib.sha256(_normalized_url(video_url).encode("utf-8")).hexdigest()[:16]
 
 
+def archive_candidate_id_for(news_id: str, kind: str, provenance: dict[str, Any]) -> str:
+    """Scope a reusable archive file to a news occurrence, keeping URLs intact."""
+    key = "\0".join(("archive", news_id, kind, str(provenance.get("source_id", "")),
+                      str(provenance.get("asset_id", "")), str(provenance.get("revision") or "")))
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
 def video_id_for(video_url: str) -> str:
     """Backward-friendly alias for callers that use the shorter name."""
     return video_candidate_id_for(video_url)
@@ -281,6 +288,7 @@ class ImageEvidence(ContractModel):
 
 
 class ImageCandidate(ContractModel):
+    archive_provenance: dict[str, Any] | None = None
     localization_provenance: LocalizationProvenance | None = None
     id: str | None = None
     news_id: str = Field(min_length=1)
@@ -332,7 +340,9 @@ class ImageCandidate(ContractModel):
 
     @model_validator(mode="after")
     def assign_stable_id(self) -> "ImageCandidate":
-        object.__setattr__(self, "id", candidate_id_for(self.image_url, self.news_id))
+        identity = (archive_candidate_id_for(self.news_id, "image", self.archive_provenance)
+                    if self.archive_provenance else candidate_id_for(self.image_url, self.news_id))
+        object.__setattr__(self, "id", identity)
         if self.signals.get("invalid_reason") or self.curation_status is ImageCurationStatus.INVALID:
             object.__setattr__(self, "selected", False)
             object.__setattr__(self, "curation_status", ImageCurationStatus.INVALID)
@@ -345,6 +355,7 @@ class ImageCandidate(ContractModel):
 
 
 class VideoCandidate(ContractModel):
+    archive_provenance: dict[str, Any] | None = None
     id: str | None = None
     news_id: str = Field(min_length=1)
     source_url: str = Field(min_length=1)
@@ -367,7 +378,9 @@ class VideoCandidate(ContractModel):
 
     @model_validator(mode="after")
     def assign_stable_id(self) -> "VideoCandidate":
-        object.__setattr__(self, "id", video_candidate_id_for(self.video_url))
+        identity = (archive_candidate_id_for(self.news_id, "video", self.archive_provenance)
+                    if self.archive_provenance else video_candidate_id_for(self.video_url))
+        object.__setattr__(self, "id", identity)
         return self
 
 

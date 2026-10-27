@@ -433,6 +433,7 @@ class ReviewSession:
             "id": stable_id,
             "news_id": news_id,
             "image_url": image_url or f"legacy://{stable_id}",
+            "archive_provenance": data.get("archive_provenance"),
             "source_url": str(data.get("source_url") or data.get("source") or f"legacy://{stable_id}"),
             "source_type": data.get("source_type", SourceType.UNKNOWN.value),
             "image_type": data.get("image_type", ImageType.UNKNOWN.value),
@@ -506,6 +507,7 @@ class ReviewSession:
             "news_id": news_id,
             "source_url": str(data.get("source_url") or f"legacy://{stable_id}"),
             "video_url": video_url or f"legacy://{stable_id}",
+            "archive_provenance": data.get("archive_provenance"),
             "title": str(data.get("title") or ""),
             "uploader": str(data.get("uploader") or ""),
             "duration_seconds": data.get("duration_seconds"),
@@ -1257,6 +1259,15 @@ class ReviewSession:
     def _export_images_and_videos(self, image_root: Path, *, include_pending: bool = True) -> dict[str, Any]:
         folder_names = self._folder_names()
         files: list[str] = []
+        archive_assets: list[dict[str, Any]] = []
+
+        def record_archive(candidate, target):
+            provenance = getattr(candidate, "archive_provenance", None)
+            if provenance:
+                archive_assets.append({"candidate_id": str(candidate.id), "news_id": candidate.news_id,
+                    "file": (Path("images") / target.relative_to(image_root)).as_posix(),
+                    "archive_provenance": dict(provenance), "source_url": candidate.source_url,
+                    "sha256": hashlib.sha256(target.read_bytes()).hexdigest()})
         image_ranks: dict[str, int] = {}
         pending_ranks: dict[str, int] = {}
         selected_count = pending_count = video_count = 0
@@ -1285,6 +1296,7 @@ class ReviewSession:
             target = self._unique_target(target, source)
             target.write_bytes(data)
             files.append((Path("images") / target.relative_to(image_root)).as_posix())
+            record_archive(candidate, target)
 
         reserved: dict[str, set[str]] = {}
         for candidate in self.videos:
@@ -1309,6 +1321,7 @@ class ReviewSession:
             if target.resolve() != source.resolve():
                 shutil.copyfile(source, target)
             files.append((Path("images") / target.relative_to(image_root)).as_posix())
+            record_archive(candidate, target)
             video_count += 1
 
         manifest = {
@@ -1319,6 +1332,8 @@ class ReviewSession:
             "pending_image_count": pending_count,
             "video_count": video_count,
         }
+        if archive_assets:
+            manifest["archive_assets"] = archive_assets
         return manifest
 
     def _issue_id(self) -> str:

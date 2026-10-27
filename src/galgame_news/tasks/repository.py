@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlsplit
@@ -28,6 +29,8 @@ _OPTIONS = {
     "llm_provider",
     "llm_model",
     "use_socialdata_x",
+    "use_archive_materials",
+    "archive_range",
     "include_x",
     "include_h",
     "include_z",
@@ -179,6 +182,9 @@ class TaskRepository:
             db.execute(
                 "ALTER TABLE review_decisions ADD COLUMN manual INTEGER NOT NULL DEFAULT 0"
             )
+        cols = {r[1] for r in db.execute("PRAGMA table_info(retry_attempts)")}
+        if "kind" not in cols:
+            db.execute("ALTER TABLE retry_attempts ADD COLUMN kind TEXT NOT NULL DEFAULT 'retry'")
         db.execute(
             "INSERT INTO task_meta(key,value) VALUES('task_schema_version','3') ON CONFLICT(key) DO UPDATE SET value=excluded.value"
         )
@@ -1153,8 +1159,8 @@ class TaskRepository:
                 ),
             )
             db.execute(
-                "INSERT INTO retry_attempts(news_id,attempt_id,path,kind) VALUES(?,?,?,?) ON CONFLICT(news_id,attempt_id) DO UPDATE SET path=excluded.path,kind=excluded.kind",
-                (news_id, attempt_id, stored_path, kind),
+                "INSERT INTO retry_attempts(news_id,attempt_id,path,kind,created_at) VALUES(?,?,?,?,?) ON CONFLICT(news_id,attempt_id) DO UPDATE SET path=excluded.path,kind=excluded.kind",
+                (news_id, attempt_id, stored_path, kind, datetime.now(timezone.utc).isoformat()),
             )
             db.commit()
 

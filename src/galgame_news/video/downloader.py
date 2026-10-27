@@ -612,7 +612,8 @@ class VideoDownloader:
                 raise ValueError("no playable video stream")
             duration = payload.get("format", {}).get("duration") or stream.get("duration")
             return {"width": int(stream["width"]), "height": int(stream["height"]),
-                    "duration_seconds": float(duration) if duration is not None else None}
+                    "duration_seconds": float(duration) if duration is not None else None,
+                    "format_name": payload.get("format", {}).get("format_name")}
         except Exception as exc:
             raise ValueError(f"video validation failed ({type(exc).__name__})") from exc
 

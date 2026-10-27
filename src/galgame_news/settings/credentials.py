@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import Any, Literal, Protocol
 
 
-CredentialName = Literal["brave_api_key", "x_bearer_token", "twitterapi_api_key", "socialdata_api_key"]
+CredentialName = Literal["brave_api_key", "x_bearer_token", "twitterapi_api_key", "socialdata_api_key", "archive_app_password"]
 _SERVICE_NAME = "galgame-news-toolbox"
-_NAMES: set[str] = {"brave_api_key", "x_bearer_token", "twitterapi_api_key", "socialdata_api_key"}
+_NAMES: set[str] = {"brave_api_key", "x_bearer_token", "twitterapi_api_key", "socialdata_api_key", "archive_app_password"}
 _ALIASES = {
     "BRAVE_SEARCH_API_KEY": "brave_api_key",
     "X_BEARER_TOKEN": "x_bearer_token",

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 from PySide6.QtCore import QElapsedTimer, QEvent, QPoint, QSize, QTimer, QUrl, Qt, Signal
@@ -9,7 +11,7 @@ from PySide6.QtGui import QDesktopServices, QIcon, QImage, QKeyEvent, QKeySequen
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
     QPushButton, QCheckBox, QScrollArea, QSplitter, QTabWidget, QTextEdit, QToolButton,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QStackedWidget,
 )
 
 from ..review import ReviewDecision, ReviewSession
@@ -18,6 +20,7 @@ from .async_images import AsyncImages, ImageRequest
 from .i18n import code, image_type_label, reason_label, status_label
 from .thumbnail_cache import ThumbnailCache
 from .review_jobs import ReviewQuery, ReviewStateWriter
+from .archive_panel import ArchivePanel
 from ..diagnostics import diagnose_error, format_error, sanitize_diagnostic
 from .ui import page_header
 from ..delivery.helpers import section_prefix
@@ -28,6 +31,7 @@ class ReviewPage(QWidget):
     retry_requested = Signal(str)
     supplement_requested = Signal(str, str)
     supplement_cancel_requested = Signal()
+    news_changed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -87,7 +91,7 @@ class ReviewPage(QWidget):
         self.news_list.currentItemChanged.connect(self._news_item_changed)
         self.tabs = QTabWidget()
         self.tabs.setObjectName("reviewTabs")
-        for label in ("已选", "未候选／待复核", "已排除", "视频"):
+        for label in ("已选", "未候选／待复核", "往期周报", "已排除", "视频"):
             self.tabs.addTab(QWidget(), label)
         self.tabs.setCurrentIndex(1)
         self.tabs.setMaximumHeight(48)
@@ -110,6 +114,11 @@ class ReviewPage(QWidget):
         self.media_list.verticalScrollBar().valueChanged.connect(self._schedule_thumbnails)
         self.media_list.viewport().installEventFilter(self)
         self.media_list.installEventFilter(self)
+        self.archive_panel = ArchivePanel()
+        self.archive_panel.setObjectName("reviewArchivePanel")
+        self.media_stack = QStackedWidget()
+        self.media_stack.addWidget(self.media_list)
+        self.media_stack.addWidget(self.archive_panel)
         self.grid_summary = QLabel("尚未加载媒体")
         self.grid_summary.setObjectName("muted")
         self.preview = QLabel("载入抓取结果后，在中间选择媒体")
@@ -208,7 +217,7 @@ class ReviewPage(QWidget):
         grid_layout.setContentsMargins(0, 0, 0, 0)
         grid_layout.addWidget(self.tabs)
         grid_layout.addWidget(self.grid_summary)
-        grid_layout.addWidget(self.media_list, 1)
+        grid_layout.addWidget(self.media_stack, 1)
         grid_layout.addWidget(self.selection_label)
         # Keep long evidence and expanded raw diagnostics inside the pane's
         # viewport; the page-level export footer stays accessible at 720px.
@@ -351,6 +360,10 @@ class ReviewPage(QWidget):
         return value[1] if isinstance(value, tuple) and value[0] == "section" else None
 
     def _news_item_changed(self, *_args: Any) -> None:
+        news_id = str(self._news_filter() or "")
+        self.news_changed.emit(news_id)
+        if news_id:
+            self.archive_panel.current_news_id = news_id
         context = (id(self.session), str(self._news_filter() or ""))
         if context != self._supplement_context:
             self.supplement_url_edit.clear()
@@ -366,25 +379,27 @@ class ReviewPage(QWidget):
         if self.session is None:
             return []
         index, news_id = self.tabs.currentIndex(), self._news_filter()
+        if index == 2:
+            return []
         section = self._selected_section()
         if section:
             allowed = {key for key, news in self._news.items() if section_prefix(str(news.get("section", ""))) == section}
             if index == 0:
                 candidates = self.session.accepted_images()
                 return [c for c in candidates if str(c.news_id) in allowed]
-            if index == 2:
+            if index == 3:
                 candidates = self.session.rejected_images()
                 return [c for c in candidates if str(c.news_id) in allowed]
-            if index == 3:
+            if index == 4:
                 candidates = [*self.session.accepted_videos(), *self.session.pending_videos()]
                 return [c for c in candidates if str(c.news_id) in allowed]
             candidates = self.session.pending_images()
             return [c for c in candidates if str(c.news_id) in allowed]
         if index == 0:
             return list(self.session.accepted_images(news_id))
-        if index == 2:
-            return list(self.session.rejected_images(news_id))
         if index == 3:
+            return list(self.session.rejected_images(news_id))
+        if index == 4:
             return [*self.session.accepted_videos(news_id), *self.session.pending_videos(news_id)]
         return list(self.session.pending_images(news_id))
 
@@ -435,6 +450,27 @@ class ReviewPage(QWidget):
         parts.extend((binding_label, resolution_label))
         return " · ".join(parts)
 
+    @staticmethod
+    def _archive_provenance_summary(candidate: Any) -> str | None:
+        provenance = getattr(candidate, "archive_provenance", None)
+        if not provenance:
+            return None
+
+        def field(name: str, *aliases: str) -> str:
+            for key in (name, *aliases):
+                value = provenance.get(key) if isinstance(provenance, Mapping) else getattr(provenance, key, None)
+                if value not in (None, ""):
+                    return str(value)
+            return ""
+
+        values = [
+            ("来源期号", field("issue_number", "issue_id")),
+            ("归档路径", field("path", "archive_path")),
+            ("原始来源", field("original_source_url", "source_url")),
+        ]
+        lines = [f"{label}：{value}" for label, value in values if value]
+        return "\n".join(lines) if lines else None
+
     def refresh(self, preserve_scroll: bool = False, preserve_position: bool = False) -> None:
         preserve_scroll = preserve_scroll or preserve_position
         self._refresh_generation += 1
@@ -443,6 +479,7 @@ class ReviewPage(QWidget):
         news_id = self._news_filter()
         section = self._selected_section()
         tab = self.tabs.currentIndex()
+        self.media_stack.setCurrentWidget(self.archive_panel if tab == 2 else self.media_list)
         view = (id(session), news_id, section, tab)
         scroll_value = self.media_list.verticalScrollBar().value() if preserve_scroll else 0
         previous = str(self._selected().id) if self._selected() else ""
@@ -456,6 +493,15 @@ class ReviewPage(QWidget):
         self.grid_summary.setText("正在整理审核列表…")
         if session is None:
             self._apply_query_result(identity, [], {}, view, previous, preserve_scroll, scroll_value)
+            return
+        if tab == 2:
+            self.media_list.clear()
+            self._items.clear()
+            self._list_items.clear()
+            self._row_candidate_by_id.clear()
+            self._row_paths.clear()
+            self.archive_panel.current_news_id = news_id
+            self.grid_summary.setText("往期周报 · 历史素材独立候选")
             return
         snapshot = session.query_snapshot()
         allowed = ({key for key, news in self._news.items()
@@ -493,10 +539,12 @@ class ReviewPage(QWidget):
                                    allowed: set[str] | None, tab: int) -> list[Any]:
         if tab == 0:
             values = list(snapshot.accepted_images(news_id))
-        elif tab == 2:
-            values = list(snapshot.rejected_images(news_id))
         elif tab == 3:
+            values = list(snapshot.rejected_images(news_id))
+        elif tab == 4:
             values = [*snapshot.accepted_videos(news_id), *snapshot.pending_videos(news_id)]
+        elif tab == 2:
+            values = []
         else:
             values = list(snapshot.pending_images(news_id))
         if allowed is not None:
@@ -575,7 +623,7 @@ class ReviewPage(QWidget):
             item = self.media_list.item(row)
             media_id = str(item.data(Qt.ItemDataRole.UserRole))
             if media_id not in desired_id_set:
-                removed = self.media_list.takeItem(row)
+                self.media_list.takeItem(row)
                 self._list_items.pop(media_id, None)
                 self._icon_rows.discard(row)
         self._row_candidate_by_id = {str(row[0].id): row[0] for row in rows}
@@ -690,10 +738,12 @@ class ReviewPage(QWidget):
         kind = "视频" if is_video else image_type_label(getattr(candidate, "image_type", None))
         decision = status_label(self.session.decision(str(candidate.id))) if self.session else ""
         localization_summary = self._localization_summary(candidate)
+        archive_summary = self._archive_provenance_summary(candidate)
         self.metadata.setText(f"{self._title(candidate)[:180]}\n{kind} · {decision} · {getattr(candidate, 'width', None) or '—'} × {getattr(candidate, 'height', None) or '—'}"
                               + (f" · 评分 {score:.1f}" if score is not None else "")
                               + (f"\n{' · '.join(self._badges(candidate))}" if self._badges(candidate) else "")
                               + (f"\n{localization_summary}" if localization_summary else "")
+                              + (f"\n{archive_summary}" if archive_summary else "")
                               + f"\n复核依据：{reason_text}")
         payload = candidate.model_dump(mode="json") if hasattr(candidate, "model_dump") else {"id": str(candidate.id)}
         payload["resolved_local_path"] = str(path) if path else None
@@ -712,6 +762,34 @@ class ReviewPage(QWidget):
             button.setEnabled(self.exporter.session is not self.session)
         for button in (self.zoom_in_button, self.zoom_out_button, self.zoom_reset_button):
             button.setEnabled(bool(path and not is_video))
+
+    def show_archive_preview(self, asset: Any, path: Path | str | None = None, *, original: bool = False) -> None:
+        """Render an archive alternative without adding it to the review session."""
+        self._archive_preview_asset = asset
+        self._archive_preview_path = Path(path) if path and (asset.kind != "video" or original) else None
+        self._current_pixmap = QPixmap()
+        self._preview_key = ""
+        self.zoom_factor = 1.0
+        self.preview.setPixmap(QPixmap())
+        is_video = asset.kind == "video"
+        source = asset.original_source_url or asset.original_url or "来源尚未记录"
+        self.metadata.setText(f"{asset.news_title or asset.name}\n往期{'视频' if is_video else '图片'} · 第{asset.issue_number}期 · 本期备选\n归档路径：{asset.path}\n原始来源：{source}")
+        self.raw_details.setPlainText(json.dumps(sanitize_diagnostic(asset.to_dict()), ensure_ascii=False, indent=2))
+        if path and (not is_video or not original):
+            self.preview.setText("正在加载往期图片预览…")
+            self._preview_key = f"archive:{asset.asset_id}:{path}:{asset.revision}"
+            self.images.request_preview(ImageRequest(self._preview_key, Path(path), QSize(2048, 2048), True))
+        else:
+            self.preview.setText("往期视频 · 点击播放后按需缓存" if is_video else "暂无缩略图 · 点击预览按需获取本图")
+        self.source_button.setText("打开来源")
+        self.source_button.setEnabled(bool(asset.original_source_url or asset.original_url))
+        self.official_button.setEnabled(False)
+        self.original_button.setEnabled(not is_video)
+        self.play_button.setEnabled(is_video)
+        for button in (self.accept_button, self.reject_button, self.pending_button):
+            button.setEnabled(False)
+        for button in (self.zoom_in_button, self.zoom_out_button, self.zoom_reset_button):
+            button.setEnabled(bool(path and (not is_video or not original)))
 
     def _selection_changed(self) -> None:
         count = len(self.media_list.selectedIndexes())
@@ -839,7 +917,7 @@ class ReviewPage(QWidget):
             if str(candidate.id) not in changed_ids:
                 continue
             is_video = bool(getattr(candidate, "video_url", None))
-            remains = (tab == 0 and decision is ReviewDecision.ACCEPTED) or (tab == 2 and decision is ReviewDecision.REJECTED) or (tab == 1 and decision is ReviewDecision.PENDING) or (tab == 3 and is_video and decision in {ReviewDecision.ACCEPTED, ReviewDecision.PENDING})
+            remains = (tab == 0 and decision is ReviewDecision.ACCEPTED) or (tab == 3 and decision is ReviewDecision.REJECTED) or (tab == 1 and decision is ReviewDecision.PENDING) or (tab == 4 and is_video and decision in {ReviewDecision.ACCEPTED, ReviewDecision.PENDING})
             if not remains:
                 moved.add(str(candidate.id))
         if not moved:
@@ -978,6 +1056,12 @@ class ReviewPage(QWidget):
         return ""
 
     def open_source(self) -> None:
+        if self.tabs.currentIndex() == 2 and getattr(self, "_archive_preview_asset", None):
+            asset = self._archive_preview_asset
+            url = asset.original_source_url or asset.original_url
+            if url:
+                QDesktopServices.openUrl(QUrl(url))
+            return
         candidate = self._selected()
         if candidate and self._source_url(candidate):
             QDesktopServices.openUrl(QUrl(self._source_url(candidate)))
@@ -988,11 +1072,21 @@ class ReviewPage(QWidget):
             QDesktopServices.openUrl(QUrl(self._official_url(candidate)))
 
     def open_original(self) -> None:
+        if self.tabs.currentIndex() == 2 and getattr(self, "_archive_preview_asset", None):
+            self.archive_panel.preview_requested.emit(self._archive_preview_asset)
+            return
         candidate = self._selected()
         if candidate and getattr(candidate, "image_url", None):
             QDesktopServices.openUrl(QUrl(str(candidate.image_url)))
 
     def play_video(self) -> None:
+        if self.tabs.currentIndex() == 2 and getattr(self, "_archive_preview_asset", None):
+            path = getattr(self, "_archive_preview_path", None)
+            if path and self._archive_preview_asset.kind == "video":
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            else:
+                self.archive_panel.preview_requested.emit(self._archive_preview_asset)
+            return
         candidate = self._selected()
         path = self.session._source_for(candidate) if self.session and candidate else None
         if path:
@@ -1210,7 +1304,7 @@ class ReviewPage(QWidget):
                 return True
         if watched is self.media_list.viewport() and event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
             self._schedule_thumbnails()
-        if watched is self.preview_scroll.viewport() and event.type() == QEvent.Type.Resize:
+        if hasattr(self, "preview_scroll") and watched is self.preview_scroll.viewport() and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self._render_preview)
         return super().eventFilter(watched, event)
 

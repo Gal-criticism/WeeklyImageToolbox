@@ -28,6 +28,7 @@ from .theme import apply_theme
 from .worker import PipelineWorker, ReviewGrabWorker
 from ..diagnostics import diagnose_error, format_error
 from .review_jobs import ReviewQuery
+from .archive_controller import ArchiveController
 
 
 class _TaskMigrationWorker(QObject):
@@ -130,6 +131,17 @@ class DesktopController(QObject):
         self.review_page.supplement_requested.connect(self.supplement_news)
         self.review_page.supplement_cancel_requested.connect(self.cancel_supplement)
         self.settings_page.theme_changed.connect(self.apply_theme)
+        self.archive_controller = ArchiveController(self)
+        self.archive_controller.busy_changed.connect(self._update_migration_action)
+        self.review_page.news_changed.connect(self._archive_news_changed)
+        self.review_page.archive_panel.refresh_requested.connect(self._refresh_archive_index)
+        self.review_page.archive_panel.query_requested.connect(self._archive_manual_query)
+        self.review_page.archive_panel.preview_requested.connect(self.archive_controller.preview)
+        self.review_page.archive_panel.asset_activated.connect(self.archive_controller.activate)
+        self.review_page.archive_panel.list_widget.currentItemChanged.connect(self._archive_selection_changed)
+        self.review_page.archive_panel.adopt_requested.connect(self.archive_controller.adopt)
+        self.settings_page.archive_connection_test_requested.connect(self._test_archive_connection)
+        self.settings_page.archive_index_update_requested.connect(self._refresh_archive_index)
 
         self._thread: QThread | None = None
         self._worker: PipelineWorker | None = None
@@ -193,7 +205,8 @@ class DesktopController(QObject):
         page = self.review_page
         return bool(self.is_running or self.is_supplement_running or self._migration_active
                     or (self._migration_thread is not None and self._migration_thread.isRunning()) or
-                    self._review_loader.busy or page.exporter.session is not None or page.has_pending_work)
+                    self._review_loader.busy or self.archive_controller.busy
+                    or page.exporter.session is not None or page.has_pending_work)
 
     @property
     def has_active_operations(self) -> bool:
@@ -201,22 +214,52 @@ class DesktopController(QObject):
         page = self.review_page
         return bool(self.is_running or self.is_supplement_running or self._migration_active
                     or (self._migration_thread is not None and self._migration_thread.isRunning())
-                    or page.exporter.busy or page._export_waiting_session is not None)
+                    or self.archive_controller.busy or page.exporter.busy or page._export_waiting_session is not None)
 
     @Slot()
     def _update_migration_action(self, *_args) -> None:
         page = self.review_page
         blocked = bool(self._closing or self._migration_active or self.is_running or self.is_supplement_running
-                       or self._review_loader.busy or page.exporter.busy or page._export_waiting_session is not None
+                       or self._review_loader.busy or self.archive_controller.busy or page.exporter.busy or page._export_waiting_session is not None
                        or page.state_writer.busy)
         self.history_page.set_migration_blocked(blocked)
+        page.export_button.setEnabled(not (self._closing or self.archive_controller.busy or page.exporter.busy))
+
+    @Slot(str)
+    def _archive_news_changed(self, news_id: str) -> None:
+        if news_id:
+            self.archive_controller.query(news_id)
+        else:
+            self.archive_controller._clear_preview()
+            self.review_page.archive_panel.set_assets("", [], "请选择一条新闻以查询往期周报")
+
+    @Slot()
+    def _refresh_archive_index(self, settings=None) -> None:
+        self.archive_controller.refresh_index(settings)
+
+    @Slot(object)
+    def _test_archive_connection(self, settings=None) -> None:
+        self.archive_controller.test_connection(settings)
+
+    @Slot(str)
+    def _archive_manual_query(self, query: str) -> None:
+        news_id = self.review_page.archive_panel.current_news_id or ""
+        if news_id and query.strip():
+            self.archive_controller.query(news_id, game_names=[query.strip()])
+
+    @Slot(object, object)
+    def _archive_selection_changed(self, current, _previous) -> None:
+        if current is not None:
+            asset = current.data(Qt.ItemDataRole.UserRole)
+            if asset is not None:
+                self.archive_controller.activate(asset)
 
     def migration_task(self, record: object) -> bool:
         """Migrate one legacy task off the GUI thread, then reload its review session."""
         if not isinstance(record, TaskRecord):
             return False
         page = self.review_page
-        if (self._closing or self._migration_active or self.is_running or self.is_supplement_running
+        if (self._closing or self._migration_active or self.is_running or self.is_supplement_running or self.archive_controller.busy
                 or self._review_loader.busy or page.exporter.busy or page._export_waiting_session is not None
                 or page.state_writer.busy or page.has_pending_work):
             self.history_page.show_migration_report("已有抓取、审核保存、载入或导出正在运行，请结束后再迁移。")
@@ -325,11 +368,13 @@ class DesktopController(QObject):
         use_socialdata_x: bool = False,
         selected_sections: list[str] | None = None,
         images_only: bool = False,
+        use_archive_materials: bool = False,
+        archive_range: str = "year",
         resume: bool = False,
         task_dir: Path | str | None = None,
         task_id: str | None = None,
     ) -> bool:
-        if (self._closing or self._migration_active or self.is_running or self.is_supplement_running or self._review_loader.busy
+        if (self._closing or self._migration_active or self.is_running or self.is_supplement_running or self._review_loader.busy or self.archive_controller.busy
                 or self.review_page.exporter.busy or self.review_page._export_waiting_session is not None):
             return False
         if request is None:
@@ -349,6 +394,8 @@ class DesktopController(QObject):
                 no_videos=no_videos,
                 use_socialdata_x=use_socialdata_x,
                 images_only=images_only,
+                use_archive_materials=use_archive_materials,
+                archive_range=archive_range,
                 selected_sections=(
                     ["x", "h", "z"] if selected_sections is None else selected_sections
                 ),
@@ -422,6 +469,8 @@ class DesktopController(QObject):
             max_images=options.get("max_images"),
             llm_provider=options.get("llm_provider"),
             llm_model=options.get("llm_model"),
+            use_archive_materials=bool(options.get("use_archive_materials", False)),
+            archive_range=options.get("archive_range", "year"),
             resume=True,
             task_dir=Path(record.task_root),
             task_id=record.task_id,
@@ -594,7 +643,7 @@ class DesktopController(QObject):
             QMessageBox.warning(self.new_task_page, "无法导入图片结果", str(exc))
 
     def load_review(self, record: object) -> ReviewSession | None:
-        if (self._migration_active or self.is_supplement_running or self.review_page.exporter.busy or self.review_page.state_writer.busy
+        if (self._migration_active or self.is_supplement_running or self.archive_controller.busy or self.review_page.exporter.busy or self.review_page.state_writer.busy
                 or self.review_page.state_writer.has_failure()):
             return self.review_page.session
         if not isinstance(record, TaskRecord):
@@ -646,7 +695,7 @@ class DesktopController(QObject):
     @Slot(object)
     def _load_review_from_page(self, record):
         """History clicks load/validate their indexes off the GUI thread."""
-        if self._closing or self._migration_active or self.is_supplement_running or self.review_page.exporter.session is not None:
+        if self._closing or self._migration_active or self.is_supplement_running or self.archive_controller.busy or self.review_page.exporter.session is not None:
             return
         if not isinstance(record, TaskRecord):
             return
@@ -758,6 +807,8 @@ class DesktopController(QObject):
                 "max_images": request.max_images,
                 "llm_provider": request.llm_provider,
                 "llm_model": request.llm_model,
+                "use_archive_materials": bool(request.use_archive_materials),
+                "archive_range": request.archive_range,
             },
         )
 
@@ -777,7 +828,7 @@ class DesktopController(QObject):
         return self._start_review_grab("supplement", news_id, source_url)
 
     def _start_review_grab(self, kind: str, news_id: str, source_url: str) -> bool:
-        if (self._closing or self._migration_active or self.is_running or self.is_supplement_running or self._review_loader.busy
+        if (self._closing or self._migration_active or self.is_running or self.is_supplement_running or self._review_loader.busy or self.archive_controller.busy
                 or self.review_page.exporter.busy or self.review_page._export_waiting_session is not None):
             self._show_grab_error(kind, RuntimeError("已有抓取或导出操作正在运行，请稍后重试"))
             if self.is_supplement_running:
@@ -978,6 +1029,7 @@ class DesktopController(QObject):
         if self._force_closing:
             return
         self._closing = self._force_closing = True
+        self.archive_controller.close(wait=False)
         self._review_load_generation += 1
         self._review_loader.invalidate()
         self.review_page.begin_force_close()
@@ -992,6 +1044,7 @@ class DesktopController(QObject):
 
     def close(self, timeout_ms: int = 1000) -> bool:
         self._closing = True
+        self.archive_controller.cancel()
         self.review_page.begin_close()
         self._review_load_generation += 1
         self._review_loader.invalidate()
@@ -1007,6 +1060,7 @@ class DesktopController(QObject):
             QThread.msleep(1)
         if self.has_pending_work or self.review_page.state_writer.has_failure():
             return False
+        self.archive_controller.close(wait=True)
         self._review_loader.pool.close()
         self.review_page.finish_close()
         self.persist_state()

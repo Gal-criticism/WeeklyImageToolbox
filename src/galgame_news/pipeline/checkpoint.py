@@ -34,6 +34,11 @@ def config_hash(config, request=None) -> str:
         }
         if request.use_socialdata_x:
             behavior["use_socialdata_x"] = True
+        # Keep old feature-off checkpoints byte-for-byte compatible.
+        if getattr(request, "use_archive_materials", False):
+            behavior["use_archive_materials"] = True
+            if getattr(request, "archive_range", "year") != "year":
+                behavior["archive_range"] = request.archive_range
         sections = getattr(request, "selected_sections", ["x", "h", "z"])
         normalized_sections = [value for value in ("x", "h", "z") if value in sections]
         if normalized_sections != ["x", "h", "z"]:

@@ -41,6 +41,18 @@ def _default_output_path() -> Path:
     return default_app_data_dir() / "output"
 
 
+class ArchiveSettings(BaseModel):
+    """Non-secret connection and indexing settings for past weekly material."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    server_url: str = ""
+    username: str = ""
+    root_path: str = ""
+    local_roots: list[str] = Field(default_factory=list)
+    range_days: int = Field(default=365, gt=0)
+
+
 class AppSettings(BaseModel):
     """Only values safe to persist as ordinary JSON.
 
@@ -77,6 +89,7 @@ class AppSettings(BaseModel):
     max_video_height: int = Field(default=1080, gt=0)
     theme: Literal["system", "light", "dark"] = "system"
     browser_enabled: bool = True
+    archive: ArchiveSettings = Field(default_factory=ArchiveSettings)
     ffmpeg_location: Path | None = Field(
         default=None,
         validation_alias=AliasChoices("ffmpeg_location", "ffmpeg_path"),
@@ -119,7 +132,6 @@ class AppSettings(BaseModel):
             mode="json",
             include=set(type(self).model_fields).intersection(AppSettings.model_fields),
         )
-
 
 class SettingsStore:
     """Atomically persist :class:`AppSettings` in app data."""
