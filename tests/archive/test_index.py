@@ -208,6 +208,125 @@ def test_same_issue_prefers_selected_then_natural_filename_and_local_same_candid
     index.close()
 
 
+def test_candidate_ids_do_not_merge_distinct_news_directories(tmp_path):
+    index = ArchiveIndex(tmp_path / "archive.sqlite")
+    index.replace_source("remote", [
+        ArchiveAsset("am-1", "remote", "image", "225", "225/AMBITIOUS MISSION/1.png", "1.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="AMBITIOUS MISSION campaign",
+                     source_kind="nextcloud", metadata={"candidate_id": "reused-id"}),
+        ArchiveAsset("am-2", "remote", "image", "225", "225/AMBITIOUS MISSION/other/1.png", "1.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="AMBITIOUS MISSION official update",
+                     source_kind="nextcloud", metadata={"candidate_id": "reused-id"}),
+        ArchiveAsset("am-3", "remote", "image", "225", "225/AMBITIOUS MISSION/third/1.png", "1.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="AMBITIOUS MISSION campaign",
+                     source_kind="nextcloud", metadata={"candidate_id": "reused-id"}),
+        ArchiveAsset("am-4", "remote", "image", "225", "225/AMBITIOUS MISSION/fourth/1.png", "1.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="",
+                     source_kind="nextcloud", metadata={"candidate_id": "reused-id"}),
+        ArchiveAsset("am-5", "remote", "image", "225", "225/AMBITIOUS MISSION/fifth/1.png", "1.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="",
+                     source_kind="nextcloud", metadata={"candidate_id": "reused-id"}),
+        ArchiveAsset("sl-1", "remote", "image", "225", "225/Sugar Lies/1.png", "1.png",
+                     ("Sugar Lies",), "2026-09-24", news_title="Sugar Lies update",
+                     source_kind="nextcloud", metadata={"candidate_id": "reused-id"}),
+    ])
+
+    ambitious = index.search(("ＡＭＢＩＴＩＯＵＳ　ＭＩＳＳＩＯＮ",), "226",
+                             now=datetime(2026, 10, 27, tzinfo=timezone.utc))
+    sugar_lies = index.search(("Sugar Lies",), "226",
+                              now=datetime(2026, 10, 27, tzinfo=timezone.utc))
+
+    assert {item.asset_id for item in ambitious} == {"am-1", "am-2", "am-3", "am-4", "am-5"}
+    assert [item.asset_id for item in sugar_lies] == ["sl-1"]
+    index.close()
+
+
+def test_game_versions_and_multigame_news_titles_are_not_fuzzy_matches(tmp_path):
+    index = ArchiveIndex(tmp_path / "archive.sqlite")
+    index.replace_source("local", [
+        ArchiveAsset("am-main", "local", "image", "225", "225/am/main.png", "main.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="AMBITIOUS MISSION update"),
+        ArchiveAsset("am-fd", "local", "image", "225", "225/am-fd/fd.png", "fd.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="AMBITIOUS MISSION FD",
+                     version="FD"),
+        ArchiveAsset("am-after", "local", "image", "225", "225/am-after/after.png", "after.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="AMBITIOUS MISSION after story",
+                     version="afterstory"),
+        ArchiveAsset("am2-fd", "local", "image", "225", "225/am2-fd/fd.png", "fd.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="AMBITIOUS MISSION 2 FD",
+                     version="FD"),
+        ArchiveAsset("sl-remake-missing-version", "local", "image", "225", "225/sl-remake/1.png", "1.png",
+                     ("Sugar Lies",), "2026-09-24", news_title="Sugar Lies remake announcement"),
+        ArchiveAsset("sl-remake-path", "local", "image", "225", "225/Sugar Lies Remake/2.png", "2.png",
+                     ("Sugar Lies",), "2026-09-24", news_title=""),
+        ArchiveAsset("am-after-missing-version", "local", "image", "225", "225/am-after/2.png", "2.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="AMBITIOUS MISSION afterstory"),
+        ArchiveAsset("sl-fd", "local", "image", "225", "225/sugar-fd/fd.png", "fd.png",
+                     ("Sugar Lies",), "2026-09-24", news_title="Sugar Lies FD", version="FD"),
+        # A real multi-work news entry is ambiguous unless this asset has its own assignment.
+        ArchiveAsset("multi", "local", "image", "225", "225/multi/shared.png", "shared.png",
+                     ("AMBITIOUS MISSION", "Sugar Lies"), "2026-09-24",
+                     news_title="AMBITIOUS MISSION × Sugar Lies collaboration"),
+        ArchiveAsset("multi-assigned", "local", "image", "225", "225/multi/am.png", "am.png",
+                     ("AMBITIOUS MISSION", "Sugar Lies"), "2026-09-24",
+                     news_title="AMBITIOUS MISSION × Sugar Lies collaboration",
+                     metadata={"asset_game_name": "AMBITIOUS MISSION"}),
+        ArchiveAsset("generic-folder", "local", "image", "225", "225/am-generic/1.png", "1.png",
+                     ("AMBITIOUS MISSION",), "2026-09-24", news_title="AMBITIOUS MISSION news"),
+    ])
+
+    now = datetime(2026, 10, 27, tzinfo=timezone.utc)
+    assert {item.asset_id for item in index.search(("AMBITIOUS MISSION",), "226", now=now)} == {
+        "am-main", "generic-folder", "multi-assigned"
+    }
+    assert [item.asset_id for item in index.search(("AMBITIOUS MISSION FD",), "226", now=now)] == ["am-fd"]
+    assert {item.asset_id for item in index.search(("AMBITIOUS MISSION afterstory",), "226", now=now)} == {
+        "am-after", "am-after-missing-version"
+    }
+    assert [item.asset_id for item in index.search(("Sugar Lies FD",), "226", now=now)] == ["sl-fd"]
+    assert [item.asset_id for item in index.search(("AMBITIOUS MISSION 2 FD",), "226", now=now)] == ["am2-fd"]
+    assert index.search(("Sugar Lies",), "226", now=now) == []  # Known FD/remake entries do not count as the base work.
+    assert [item.asset_id for item in index.search(("AMBITIOUS MISSION",), "226", now=now)
+            if item.asset_id == "multi-assigned"] == ["multi-assigned"]
+    assert {item.asset_id for item in index.search(("AMBITIOUS MISSION",), "226", days=None, now=now)} == {
+        "am-main", "generic-folder", "multi-assigned"
+    }
+    index.close()
+
+
+def test_japanese_edition_qualifiers_do_not_leak_into_the_base_work(tmp_path):
+    index = ArchiveIndex(tmp_path / "archive.sqlite")
+    index.replace_source("local", [
+        ArchiveAsset("base", "local", "image", "225", "225/base/1.png", "1.png",
+                     ("星の終わり",), "2026-09-24", news_title="『星の終わり』公式更新"),
+        ArchiveAsset("fan-disc", "local", "image", "225", "225/fd/1.png", "1.png",
+                     ("星の終わり",), "2026-09-24", news_title="『星の終わり』ファンディスク発売"),
+        ArchiveAsset("after", "local", "image", "225", "225/after/1.png", "1.png",
+                     ("星の終わり",), "2026-09-24", news_title="星の終わり アフターストーリー公開"),
+        ArchiveAsset("remake", "local", "image", "225", "225/remake/1.png", "1.png",
+                     ("星の終わり",), "2026-09-24", news_title="星の終わり リメイク決定"),
+    ])
+    now = datetime(2026, 10, 27, tzinfo=timezone.utc)
+
+    assert [item.asset_id for item in index.search(("星の終わり",), "226", now=now)] == ["base"]
+    assert [item.asset_id for item in index.search(("星の終わり FD",), "226", now=now)] == ["fan-disc"]
+    assert [item.asset_id for item in index.search(("星の終わり afterstory",), "226", now=now)] == ["after"]
+    assert [item.asset_id for item in index.search(("星の終わり remake",), "226", now=now)] == ["remake"]
+    index.close()
+
+
+def test_nextcloud_archive_url_is_not_reloaded_as_an_original_source():
+    archive_url = "https://cloud.example/remote.php/dav/files/user/archive/226/game/1.png"
+    legacy = ArchiveAsset(
+        "legacy", "nextcloud", "image", "226", "/archive/226/game/1.png", "1.png",
+        ("Game",), source_kind="nextcloud", original_url=archive_url,
+        original_source_url=archive_url,
+    )
+
+    assert legacy.original_source_url is None
+    assert legacy.original_url == archive_url
+
+
 def test_search_returns_all_assets_from_two_latest_matching_issues_without_other_games(tmp_path):
     index = ArchiveIndex(tmp_path / "archive.sqlite")
     index.replace_source("local", [

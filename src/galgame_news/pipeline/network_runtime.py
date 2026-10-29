@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import CancelledError
 from dataclasses import asdict
 import time
 from urllib.parse import urlsplit
@@ -17,6 +17,7 @@ from ..discovery.adapters.html import OfficialHtmlAdapter
 from ..discovery.browser import BrowserRenderer
 from ..domain import CollectionContext, FailureRecord, FailureStage, ReviewReason, SourceType
 from .contracts import CancellationRequested
+from ..concurrency import DaemonTaskPool as _DaemonTaskPool
 
 
 class SyncHttpBridge:
@@ -38,7 +39,7 @@ class SyncHttpBridge:
         return self.runtime.submit(self.client.post_json(url, payload))
 
     def validate_url(self, url):
-        self.client.validate_url(url)
+        self.runtime.submit(self.client._validate_url(url))
 
     def __call__(self, url, **kwargs):
         header = kwargs.get("headers", {}).get("cookie", "")
@@ -70,22 +71,47 @@ class TaskNetworkRuntime:
         )
         self.page_bridge = SyncHttpBridge(self, self.page_client)
         self.browser = BrowserRenderer(self.page_client, config.browser, token)
-        self.compat = ThreadPoolExecutor(max_workers=network.page_concurrency, thread_name_prefix="galgame-source")
-        self.processing = ThreadPoolExecutor(max_workers=network.image_processing_threads, thread_name_prefix="galgame-image")
+        self.compat = _DaemonTaskPool(
+            max_workers=network.page_concurrency,
+            thread_name_prefix="galgame-source",
+        )
+        self.processing = _DaemonTaskPool(max_workers=network.image_processing_threads, thread_name_prefix="galgame-image")
+        # Timed-out third-party parsers may retain all compatibility workers.
+        # Saving their partial results must still have an available worker.
+        self.persistence = _DaemonTaskPool(max_workers=1, thread_name_prefix="galgame-state")
         self._compat_slots = asyncio.Semaphore(network.page_concurrency)
         self.timings = {}
         self._active = set()
         self._source_responses = {}
+        self.resolve_failures = []
 
-    async def call_sync(self, call):
-        async with self._compat_slots:
-            while self.token.is_paused and not self.token.is_cancelled:
-                await asyncio.sleep(0.05)
-            if self.token.is_cancelled:
-                raise asyncio.CancelledError()
-            return await self.loop.run_in_executor(self.compat, call)
+    async def call_sync(self, call, timeout=None):
+        timeout = self.runner.config.network.news_timeout_seconds if timeout is None else timeout
+        async def invoke():
+            async with self._compat_slots:
+                while self.token.is_paused and not self.token.is_cancelled:
+                    await asyncio.sleep(0.05)
+                if self.token.is_cancelled:
+                    raise asyncio.CancelledError()
+                # A timed-out callable cannot be killed by Python. Give each
+                # admitted call its own daemon worker so it cannot occupy a
+                # shared worker needed by the next source or publication.
+                worker = _DaemonTaskPool(max_workers=1, thread_name_prefix="galgame-call")
+                future = self.loop.run_in_executor(worker, call)
+                try:
+                    return await future
+                except asyncio.CancelledError:
+                    future.cancel()
+                    raise
+                finally:
+                    worker.shutdown(wait=False, cancel_futures=True)
+        try:
+            return await asyncio.wait_for(invoke(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"synchronous compatibility call exceeded {timeout:g} seconds") from None
 
-    def submit(self, awaitable):
+    def submit(self, awaitable, timeout=None):
+        timeout = self.runner.config.network.news_timeout_seconds if timeout is None else timeout
         async def tracked():
             task = asyncio.current_task()
             self._active.add(task)
@@ -94,12 +120,22 @@ class TaskNetworkRuntime:
             finally:
                 self._active.discard(task)
         try:
-            return asyncio.run_coroutine_threadsafe(tracked(), self.loop).result()
+            future = asyncio.run_coroutine_threadsafe(tracked(), self.loop)
+            try:
+                return future.result(timeout=timeout)
+            except TimeoutError:
+                future.cancel()
+                raise
         except CancelledError:
             raise CancellationRequested("pipeline cancellation requested") from None
 
     async def resolve(self, resolver, news):
-        return await self._timed("resolve", resolve_async(resolver, news, self.page_client, self.call_sync))
+        report = getattr(self, "resolve_progress", None)
+        self.resolve_failures = []
+        return await self._timed("resolve", resolve_async(
+            resolver, news, self.page_client, self.call_sync, progress=report,
+            on_failure=self.resolve_failures.append,
+        ))
 
     async def collect_many(self, news, sources, request, *, _goods_expand=True):
         if _goods_expand:
@@ -107,7 +143,9 @@ class TaskNetworkRuntime:
         from ..discovery.goods_context import is_goods_news
         if _goods_expand and is_goods_news(news) and self.runner.adapter_factory is None and not request.offline:
             from .goods_collection import collect_goods
-            return await collect_goods(self, news, sources, request)
+            results = await collect_goods(self, news, sources, request)
+            self._record_supplement_pages(news, sources, results, request)
+            return results
         if not getattr(self.runner, "_localization_service", None):
             from ..localization.service import LocalizationImageService
             self.runner._localization_service = LocalizationImageService(self.page_bridge)
@@ -118,7 +156,21 @@ class TaskNetworkRuntime:
                 raise asyncio.CancelledError()
             except Exception as exc:
                 return exc
-        results = await self._timed("collect", asyncio.gather(*(collect(source) for source in sources)))
+        async def collect_guarded(source):
+            try:
+                return await asyncio.wait_for(
+                    collect(source),
+                    timeout=self.runner.config.network.news_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                return TimeoutError(
+                    f"来源采集超过 {self.runner.config.network.news_timeout_seconds:g} 秒"
+                )
+
+        results = await self._timed(
+            "collect",
+            asyncio.gather(*(collect_guarded(source) for source in sources)),
+        )
         from ..delivery.helpers import section_prefix, section_label
         if section_prefix(section_label(news)) == "h":
             for result in results:
@@ -126,6 +178,7 @@ class TaskNetworkRuntime:
                     continue
                 self.runner._bind_localization_context(news, result.candidates)
         if self.runner.adapter_factory is not None or request.offline:
+            self._record_supplement_pages(news, sources, results, request)
             return results
         # Merge on the coordinator in source order. Rendering never starts
         # inside a synchronous parser/compatibility thread.
@@ -136,7 +189,12 @@ class TaskNetworkRuntime:
             from ..discovery.goods_service import GoodsSourceService, goods_page_text
             goods = GoodsSourceService.supports(news, source)
             active_parser = GoodsSourceService(self.page_bridge) if goods else parser
-            if isinstance(result, Exception) or (source.source_type is not SourceType.OFFICIAL_SITE and not goods):
+            supplement_html = (
+                getattr(self.runner, "_supplement_mode", False)
+                and (urlsplit(source.url).hostname or "").casefold()
+                not in {"ymgal.games", "www.ymgal.games", "vndb.org", "www.vndb.org", "store.steampowered.com"}
+            )
+            if isinstance(result, Exception) or (source.source_type is not SourceType.OFFICIAL_SITE and not goods and not supplement_html):
                 continue
             try:
                 response = self._source_responses.get(source.url)
@@ -199,16 +257,59 @@ class TaskNetworkRuntime:
             except Exception as exc:
                 result.failures.append(FailureRecord(stage=FailureStage.COLLECT, news_id=news.id,
                     code="browser_collect_failed", message=f"动态采集失败（{type(exc).__name__}）。", source_url=source.url, retryable=True))
+        self._record_supplement_pages(news, sources, results, request)
         return results
+
+    def _record_supplement_pages(self, news, sources, results, request):
+        """Record exact normal-collection evidence only for opted-in tasks."""
+        if (not getattr(request, "use_image_supplement", False)
+                or not getattr(self.runner, "_download_journal", None)
+                or getattr(self.runner, "_supplement_mode", False)):
+            return
+        try:
+            from ..supplement.ledger import SupplementLedger
+            ledger = SupplementLedger(self.runner._download_journal.root)
+            for source, result in zip(sources, results):
+                if isinstance(result, Exception):
+                    ledger.set_state(news.id, source.url, "failed", detail="normal collection raised")
+                    continue
+                failures = list(getattr(result, "failures", []) or [])
+                candidates = [c for c in getattr(result, "candidates", []) if c.news_id == news.id]
+                if failures:
+                    ledger.set_state(news.id, source.url, "partial" if candidates else "failed",
+                        detail="normal collection returned failures")
+                    if candidates:
+                        ledger.set_page(source.url, source, candidates)
+                    continue
+                status = "completed" if candidates else "no_assets"
+                ledger.set_state(news.id, source.url, status, detail="normal collection completed")
+                ledger.set_page(source.url, source, candidates)
+        except Exception:
+            # Supplement bookkeeping must never fail the primary news collection.
+            return
 
     async def download(self, candidates, directory, *, on_result=None):
         downloader = ImageDownloader(self.runner.config)
-        result = await self._timed("download_and_processing", downloader.download_async(
+        result = await self._timed("download_and_processing", asyncio.wait_for(downloader.download_async(
             candidates, directory, client=self.image_client, executor=self.processing,
             concurrency=self.runner.config.network.image_concurrency,
             on_result=on_result,
-        ))
+        ), timeout=self.runner.config.network.news_timeout_seconds))
         self.timings["image_processing_worker_seconds"] = self.timings.get("image_processing_worker_seconds", 0.0) + downloader.processing_seconds
+        if (getattr(self.runner, "_image_supplement_enabled", False)
+                and getattr(self.runner, "_download_journal", None)
+                and not getattr(self.runner, "_supplement_mode", False)):
+            try:
+                from ..supplement.ledger import SupplementLedger, normalize_url
+                from ..discovery.resolver import DefaultSourceResolver
+                ledger = SupplementLedger(self.runner._download_journal.root)
+                groups = {}
+                for candidate in candidates:
+                    groups.setdefault(normalize_url(candidate.source_url), []).append(candidate)
+                for key, values in groups.items():
+                    ledger.set_page(key, DefaultSourceResolver._document_source(key), values)
+            except Exception:
+                pass
         return result
 
     def socialdata_lookup(self, status_url, *, token, timeout):
@@ -271,5 +372,8 @@ class TaskNetworkRuntime:
         await self.image_client.close()
         await self.socialdata.close()
         # Compatibility calls already drain before the coordinator returns.
-        await asyncio.to_thread(self.compat.shutdown, wait=True, cancel_futures=True)
-        await asyncio.to_thread(self.processing.shutdown, wait=True, cancel_futures=True)
+        # Third-party DNS/search code may ignore cancellation. Daemon workers
+        # may finish later without keeping the task or desktop process alive.
+        self.compat.shutdown(wait=False, cancel_futures=True)
+        self.persistence.shutdown(wait=False, cancel_futures=True)
+        self.processing.shutdown(wait=False, cancel_futures=True)

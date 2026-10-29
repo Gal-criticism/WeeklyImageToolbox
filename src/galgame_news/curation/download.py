@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import hashlib
 import os
 import uuid
@@ -103,6 +104,12 @@ def _image_quality_signals(data: bytes, width: int, height: int) -> dict[str, fl
         return {"quality_analysis_failed": True}
 
 
+class _PublishGuard:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cancelled = threading.Event()
+
+
 class ImageDownloader:
     def __init__(self, config: PrescanConfig, *, transport: Callable[..., Any] | None = None):
         self.config = config
@@ -198,7 +205,7 @@ class ImageDownloader:
 
         return root, candidate_order, pending, filtered, invalid
 
-    def _process_response(self, candidate, response, root, temporary=None):
+    def _process_response(self, candidate, response, root, temporary=None, publish_guard=None):
         started = time.monotonic()
         try:
             status = int(getattr(response, "status_code", 200))
@@ -215,39 +222,12 @@ class ImageDownloader:
                 return candidate, self._failure(candidate, validation.reason or "invalid_image", "downloaded image failed validation", False), None
             suffix = _EXTENSIONS.get(validation.mime_type or "", ".img")
             task_assets = TaskAssets.for_path(root)
-            if task_assets is not None:
-                from ..tasks.repository import TaskRepository
-                digest = hashlib.sha256(data).hexdigest()
-                # Durable intent bridges the crash window between landing the
-                # hash file and the coordinator committing download success.
-                TaskRepository(task_assets.root, create=False).prepare_asset(str(candidate.id), {
-                    "original_path": str(task_assets.original_path(data, suffix)),
-                    "original_sha256": digest, "original_mime_type": validation.mime_type,
-                    "original_width": validation.width, "original_height": validation.height,
-                    "original_byte_size": len(data), "downloaded_url": final_response_url,
-                })
-            target = task_assets.put_original(data, suffix) if task_assets else root / f"{candidate.id}{suffix}"
-            if temporary is None:
-                if not task_assets:
-                    temporary = root / f".{candidate.id}-{uuid.uuid4().hex}.part"
-                    temporary.write_bytes(data)
-            if not task_assets:
-                os.replace(temporary, target)
-            candidate.width, candidate.height = validation.width, validation.height
-            candidate.mime_type, candidate.byte_size = validation.mime_type, len(data)
-            candidate.sha256, candidate.perceptual_hash = hashlib.sha256(data).hexdigest(), _perceptual_hash(data)
-            candidate.local_path, candidate.downloadable = str(target), True
-            candidate.original_path = str(target)
-            candidate.original_mime_type = validation.mime_type
-            candidate.original_byte_size = len(data)
-            candidate.original_sha256 = candidate.sha256
-            candidate.original_width, candidate.original_height = validation.width, validation.height
-            candidate.downloaded_url = final_response_url
-            self._success(candidate)
-            if candidate.expected_width and candidate.expected_height:
-                candidate.signals["x_original_dimensions_match"] = (validation.width == candidate.expected_width and validation.height == candidate.expected_height)
-            candidate.signals.update(_image_quality_signals(data, validation.width or 0, validation.height or 0))
-            return candidate, None, final_response_url
+            if publish_guard is not None:
+                with publish_guard.lock:
+                    if publish_guard.cancelled.is_set():
+                        return candidate, self._failure(candidate, "processing_timeout", "image processing exceeded its time limit", True), None
+                    return self._publish_processed(candidate, response, root, temporary, task_assets, data, validation, final_response_url, suffix)
+            return self._publish_processed(candidate, response, root, temporary, task_assets, data, validation, final_response_url, suffix)
         except Exception as exc:
             return candidate, self._exception_failure(candidate, exc), None
         finally:
@@ -256,6 +236,40 @@ class ImageDownloader:
             with self._timing_lock:
                 self.processing_seconds += time.monotonic() - started
 
+    def _publish_processed(self, candidate, response, root, temporary, task_assets, data, validation, final_response_url, suffix):
+        if task_assets is not None:
+            from ..tasks.repository import TaskRepository
+            digest = hashlib.sha256(data).hexdigest()
+            # Durable intent bridges the crash window between landing the
+            # hash file and the coordinator committing download success.
+            TaskRepository(task_assets.root, create=False).prepare_asset(str(candidate.id), {
+                "original_path": str(task_assets.original_path(data, suffix)),
+                "original_sha256": digest, "original_mime_type": validation.mime_type,
+                "original_width": validation.width, "original_height": validation.height,
+                "original_byte_size": len(data), "downloaded_url": final_response_url,
+            })
+        target = task_assets.put_original(data, suffix) if task_assets else root / f"{candidate.id}{suffix}"
+        if temporary is None:
+            if not task_assets:
+                temporary = root / f".{candidate.id}-{uuid.uuid4().hex}.part"
+                temporary.write_bytes(data)
+        if not task_assets:
+            os.replace(temporary, target)
+        candidate.width, candidate.height = validation.width, validation.height
+        candidate.mime_type, candidate.byte_size = validation.mime_type, len(data)
+        candidate.sha256, candidate.perceptual_hash = hashlib.sha256(data).hexdigest(), _perceptual_hash(data)
+        candidate.local_path, candidate.downloadable = str(target), True
+        candidate.original_path = str(target)
+        candidate.original_mime_type = validation.mime_type
+        candidate.original_byte_size = len(data)
+        candidate.original_sha256 = candidate.sha256
+        candidate.original_width, candidate.original_height = validation.width, validation.height
+        candidate.downloaded_url = final_response_url
+        self._success(candidate)
+        if candidate.expected_width and candidate.expected_height:
+            candidate.signals["x_original_dimensions_match"] = (validation.width == candidate.expected_width and validation.height == candidate.expected_height)
+        candidate.signals.update(_image_quality_signals(data, validation.width or 0, validation.height or 0))
+        return candidate, None, final_response_url
 
     def _finish(self, outcomes, candidate_order, filtered, invalid):
         accepted: list[ImageCandidate] = []
@@ -300,7 +314,16 @@ class ImageDownloader:
     async def download_async(self, candidates, directory, *, client, executor, concurrency=8, on_result=None):
         """Stream with a bounded window; CPU processing never runs on the loop."""
         loop = asyncio.get_running_loop()
-        root, order, pending, filtered, invalid = await loop.run_in_executor(executor, self._prepare, candidates, directory)
+        isolated_candidates = [candidate.model_copy(deep=True) for candidate in candidates]
+        prepare = loop.run_in_executor(executor, self._prepare, isolated_candidates, directory)
+        try:
+            root, order, pending, filtered, invalid = await asyncio.wait_for(
+                asyncio.shield(prepare), self.config.network.news_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            prepare.cancel()
+            raise TimeoutError("image preparation exceeded its time limit") from None
+        originals = {str(candidate.id): candidate for candidate in candidates}
         outcomes = [None] * len(pending)
         results = asyncio.Queue()
         queue = asyncio.Queue()
@@ -312,43 +335,57 @@ class ImageDownloader:
                 while not queue.empty():
                     index, candidate = queue.get_nowait()
                     temporary = root / f".{candidate.id}-{uuid.uuid4().hex}.part"
+                    worker_owns_temp = False
                     try:
                         async def attempt(url, *, fallback=False):
+                            nonlocal worker_owns_temp
                             kwargs = {"max_retries": 1} if fallback else {}
                             response = await client.download(url, temporary, **kwargs)
-                            processing = loop.run_in_executor(executor, self._process_response, candidate, response, root, temporary)
+                            isolated = candidate.model_copy(deep=True)
+                            guard = _PublishGuard()
+                            processing = loop.run_in_executor(executor, self._process_response, isolated, response, root, temporary, guard)
+                            worker_owns_temp = True
                             try:
-                                return await asyncio.shield(processing)
+                                return await asyncio.wait_for(asyncio.shield(processing), self.config.network.news_timeout_seconds)
+                            except asyncio.TimeoutError:
+                                guard.cancelled.set()
+                                return isolated, self._failure(candidate, "processing_timeout", "image processing exceeded its time limit", True), None
                             except asyncio.CancelledError:
-                                outcomes[index] = await processing
-                                results.put_nowait((index, outcomes[index]))
+                                guard.cancelled.set()
                                 raise
                         try:
                             outcome = await attempt(self._primary_url(candidate))
                         except Exception as exc:
                             outcome = candidate, self._exception_failure(candidate, exc), None
-                        if self._fallback_allowed(candidate, outcome[1]):
+                        if outcome[1] is not None and outcome[1].code != "processing_timeout" and self._fallback_allowed(candidate, outcome[1]):
                             outcome = await attempt(candidate.media_source_url, fallback=True)
                             if outcome[1] is None:
-                                candidate.signals["x_original_fallback"] = True
+                                outcome[0].signals["x_original_fallback"] = True
                         outcomes[index] = outcome
                     except Exception as exc:
                         outcomes[index] = candidate, self._exception_failure(candidate, exc), None
                     finally:
                         if outcomes[index] is not None:
                             results.put_nowait((index, outcomes[index]))
-                        temporary.unlink(missing_ok=True)
+                        if not worker_owns_temp:
+                            temporary.unlink(missing_ok=True)
                         queue.task_done()
             finally:
                 results.put_nowait(None)
 
         async def notify(outcome):
             candidate, failure, _ = outcome
+            original = originals.get(str(candidate.id), candidate)
+            if candidate is not original and failure is None:
+                original.__dict__.clear()
+                original.__dict__.update(candidate.__dict__)
+            candidate = original
             self._apply_outcome(candidate, failure)
             if on_result is not None:
                 result = on_result(candidate, failure)
                 if inspect.isawaitable(result):
                     await result
+            return candidate, failure, outcome[2]
 
         tasks = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(pending)))]
         delivered = set()
@@ -364,7 +401,7 @@ class ImageDownloader:
                 if item is None:
                     finished += 1
                 elif item[0] not in delivered:
-                    await notify(item[1])
+                    outcomes[item[0]] = await notify(item[1])
                     delivered.add(item[0])
             await asyncio.gather(*tasks)
         finally:
@@ -373,7 +410,7 @@ class ImageDownloader:
             await asyncio.gather(*tasks, return_exceptions=True)
             for index, outcome in enumerate(outcomes):
                 if outcome is not None and index not in delivered:
-                    await notify(outcome)
+                    outcomes[index] = await notify(outcome)
         return self._finish(outcomes, order, filtered, invalid)
 
     @staticmethod

@@ -34,6 +34,16 @@ class ArchiveAsset:
         if self.source_kind not in {"local", "nextcloud"}:
             raise ValueError("source_kind must be 'local' or 'nextcloud'")
         object.__setattr__(self, "game_names", tuple(self.game_names or ()))
+        if (
+            self.source_kind == "nextcloud"
+            and self.original_source_url
+            and self.original_url
+            and self.original_source_url == self.original_url
+        ):
+            # Legacy indexes duplicated the WebDAV file URL into the original
+            # news-source field.  It proves the archive copy, not the upstream
+            # publisher URL, so keep it only as the materialization URL.
+            object.__setattr__(self, "original_source_url", None)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -110,7 +110,7 @@ def test_async_video_rows_keep_local_playback_entry(qtbot, tmp_path, monkeypatch
     page = ReviewPage()
     qtbot.addWidget(page)
     page.set_session(session)
-    page.tabs.setCurrentIndex(4)
+    page.tabs.setCurrentIndex(5)
     _wait_loaded(qtbot, page, 1)
     page.media_list.setCurrentRow(0)
     assert page.play_button.isEnabled()

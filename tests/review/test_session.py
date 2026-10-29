@@ -111,6 +111,58 @@ def test_review_state_is_atomic_and_survives_reopen(tmp_path):
     assert reopened.decision("pending") is ReviewDecision.ACCEPTED
 
 
+def test_unadopted_supplement_is_hidden_unexported_and_adoption_persists(tmp_path):
+    candidate = _candidate(tmp_path, "supplement", review=True)
+    candidate["signals"] = {"supplement_module": True, "supplement_adopted": False,
+                            "supplement_source": "official", "supplement_relation": "title match"}
+    output = _write_output(tmp_path, [candidate], review_required=[candidate])
+    state = tmp_path / "review_state.json"
+    task_root = tmp_path / "task"
+    session = ReviewSession.from_output(output, task_root=task_root, state_path=state)
+    assert session.supplement_candidates("n1")
+    assert session.pending_images() == []
+    session.export_final(include_pending=True)
+    assert not list((task_root / "final" / "images").rglob("*.png"))
+
+    session.adopt_supplement_candidates(["supplement"])
+    assert [str(item.id) for item in session.pending_images()] == ["supplement"]
+    session.set_supplement_classification("supplement", ImageType.BACKGROUND_ART)
+    manifest = session.export_final(include_pending=True)
+    provenance = manifest["supplement_assets"][0]
+    assert provenance["candidate_id"] == "supplement"
+    assert provenance["supplement_relation"] == "title match"
+    assert provenance["source_url"] == candidate["source_url"]
+    assert provenance["supplement_relation"] == "title match"
+    assert provenance["review_classification"] == "background_art"
+    reopened = ReviewSession.from_output(output, task_root=task_root, state_path=state)
+    assert reopened.supplement_candidates() == []
+    assert [str(item.id) for item in reopened.pending_images()] == ["supplement"]
+    assert reopened._image_by_id["supplement"].image_type is ImageType.BACKGROUND_ART
+
+
+def test_json_supplement_directory_can_be_merged_for_review(tmp_path):
+    base_candidate = _candidate(tmp_path, "auto-image", review=True)
+    output = _write_output(tmp_path, [])
+    task_root = tmp_path / "task"
+    supplement_dir = task_root / "supplement" / "n1"
+    image_dir = supplement_dir / "images"
+    image_dir.mkdir(parents=True)
+    image_path = image_dir / "auto-image.jpg"
+    image_path.write_bytes(_jpeg_bytes())
+    base_candidate.update(local_path="images/auto-image.jpg", selected=False,
+                          signals={"supplement_module": True, "supplement_adopted": False})
+    (supplement_dir / "image_index.json").write_text(json.dumps({
+        "kind": "supplement", "status": "completed", "candidates": [base_candidate], "failures": [],
+    }), encoding="utf-8")
+    session = ReviewSession.from_output(output, task_root=task_root,
+                                        state_path=task_root / "review_state.json")
+
+    session.merge_supplement_directory(supplement_dir, "n1", persist=False)
+
+    assert [str(candidate.id) for candidate in session.supplement_candidates()] == ["auto-image"]
+    assert session.pending_images() == []
+
+
 def test_export_final_uses_x_prefix_and_does_not_modify_raw(tmp_path):
     candidate = _candidate(tmp_path, "accepted", selected=True)
     output = _write_output(tmp_path, [candidate])

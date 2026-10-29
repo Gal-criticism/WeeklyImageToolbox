@@ -20,8 +20,47 @@ def test_socialdata_is_opt_in_per_task_and_included_in_start_request(tmp_path):
 
     assert payloads[0]["use_socialdata_x"] is True
     assert payloads[0]["selected_sections"] == ["x", "h", "z"]
+    assert payloads[0]["use_image_supplement"] is False
+    assert payloads[0]["supplement_target_images"] == 5
     page.close()
     app.processEvents()
+
+
+def test_supplement_options_are_opt_in_and_disabled_offline(qtbot, tmp_path):
+    page = NewTaskPage(default_output=tmp_path / "output")
+    qtbot.addWidget(page)
+    page.set_input_path(tmp_path / "261.docx")
+    payloads = []
+    page.start_requested.connect(payloads.append)
+    assert page.supplement_target_spin.value() == 5
+    page.image_supplement_checkbox.setChecked(True)
+    assert not page.supplement_options.isHidden()
+    page.offline_checkbox.setChecked(True)
+    assert not page.image_supplement_checkbox.isEnabled()
+    assert not page.image_supplement_checkbox.isChecked()
+    page.offline_checkbox.setChecked(False)
+    page.image_supplement_checkbox.setChecked(True)
+    page.request_start()
+    assert payloads[0]["use_image_supplement"] is True
+    assert payloads[0]["supplement_sources"] == ["official", "store", "ymgal", "vndb"]
+    page.supplement_source_checkboxes["official"].setChecked(False)
+    page.supplement_source_checkboxes["ymgal"].setChecked(False)
+    page.request_start()
+    assert payloads[-1]["supplement_sources"] == ["store", "vndb"]
+
+
+def test_supplement_requires_at_least_one_source_when_enabled(qtbot, tmp_path):
+    page = NewTaskPage(default_output=tmp_path / "output")
+    qtbot.addWidget(page)
+    page.set_input_path(tmp_path / "261.docx")
+    page.image_supplement_checkbox.setChecked(True)
+    for checkbox in page.supplement_source_checkboxes.values():
+        checkbox.setChecked(False)
+    payloads = []
+    page.start_requested.connect(payloads.append)
+    page.request_start()
+    assert payloads == []
+    assert "至少选择一个来源" in page.drop_hint.text()
 
 
 @pytest.mark.parametrize(

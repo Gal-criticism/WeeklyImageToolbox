@@ -202,7 +202,7 @@ class ProgressPage(QWidget):
         summary = event_summary(kind)
         if kind.endswith("_failed"):
             summary += "；" + error_summary(message)
-        if kind == "news_started":
+        if kind in {"news_started", "resolve_progress"}:
             summary += "：" + message
         self.log.appendPlainText(summary)
         self.technical_log.appendPlainText(f"[{kind}] {message}")

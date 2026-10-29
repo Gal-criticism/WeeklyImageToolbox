@@ -54,10 +54,10 @@ def _configure_portable_runtime() -> None:
 
 _configure_portable_runtime()
 
-from galgame_news.desktop.app import main
-
-
 if __name__ == "__main__":
+    from multiprocessing import freeze_support
+    freeze_support()
+    from galgame_news.desktop.app import main
     if "--self-check" in sys.argv:
         import json
         from galgame_news.desktop.app import create_application
@@ -65,6 +65,14 @@ if __name__ == "__main__":
         from galgame_news.settings.browser import check_browser_runtime
         from galgame_news.config import load_config
         from playwright.sync_api import sync_playwright
+        from galgame_news.discovery.search import _run_spawned_worker
+        from galgame_news.discovery.search_worker import ddgs_search_worker
+
+        # Exercise Windows frozen spawn without making a network request.
+        search_ok, search_results = _run_spawned_worker(
+            ddgs_search_worker, ((), 1, 10.0), 10.0,
+            process_name="galgame-search-package-check",
+        )
 
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         app, window = create_application([])
@@ -106,6 +114,7 @@ if __name__ == "__main__":
                   "brand_resources": resource_path("character.png").is_file() and resource_path("toolbox.ico").is_file(),
                   "offline_review_export_restore": offline_review, "browser_available": browser.available,
                   "browser_launch": launched, "ffmpeg": ffmpeg.available,
+                  "search_subprocess": search_ok and search_results == [],
                   "ffprobe": bool(ffmpeg.ffprobe_path), "config": bool(load_config()),
                   "no_private_key_seed": not (root / ".private-socialdata-key").exists()}
         (root / "package_self_check.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -44,6 +44,7 @@ class DefaultSourceResolver:
         self.same_domain_depth = max(0, min(3, same_domain_depth))
         # Some official sites establish TLS slowly; a five-second discovery
         # timeout prevented their product pages from ever being reached.
+        self.search_timeout = max(0.1, float(search_timeout))
         self.same_domain_client = SafeHttpClient(transport=same_domain_transport, timeout=max(20.0, search_timeout), max_retries=2)
         self.search_provider = search_provider or FallbackSearchProvider(max_results=search_max_results, timeout=search_timeout).search
 

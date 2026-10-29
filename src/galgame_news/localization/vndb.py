@@ -276,6 +276,11 @@ def _collect_screenshots(out, news, source, source_chain, context, work_id, bind
     for shot, image_url, resolution, dims, variant_of in variants:
         if not isinstance(shot, dict) or not shot.get("url"):
             continue
+        sexual = shot.get("sexual")
+        # VNDB sexual rating is per screenshot. Explicitly rated sexual images
+        # are omitted; missing ratings remain review-only below.
+        if sexual is not None and str(sexual).isdigit() and int(sexual) > 0:
+            continue
         release_id = (shot.get("release") or {}).get("id", "") if isinstance(shot.get("release"), dict) else ""
         if len(out) >= context.max_candidates:
             break
@@ -297,7 +302,14 @@ def _collect_screenshots(out, news, source, source_chain, context, work_id, bind
             "localization_screenshot_release_id": str(release_id),
             "localization_binding": binding_value, "localization_resolution": resolution,
             "localization_screenshot": True, "localization_native": resolution == "full"})
-        if resolution != "full" or binding != "confirmed" or binding_conflict:
+        candidate.signals["localization_screenshot_sexual"] = sexual if sexual is not None else "unknown"
+        if shot.get("violence") is not None:
+            candidate.signals["localization_screenshot_violence"] = shot["violence"]
+        if data.get("rating") is not None:
+            candidate.signals["localization_work_rating"] = data["rating"]
+        if data.get("votecount") is not None:
+            candidate.signals["localization_work_votecount"] = data["votecount"]
+        if resolution != "full" or binding != "confirmed" or binding_conflict or sexual is None:
             candidate.signals["localization_review_only"] = True
         if relation_of:
             candidate.signals["localization_relation_of"] = relation_of

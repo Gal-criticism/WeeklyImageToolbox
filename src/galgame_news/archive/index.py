@@ -7,7 +7,7 @@ import re
 import sqlite3
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 from .models import ArchiveAsset
@@ -128,7 +128,7 @@ class ArchiveIndex:
             if asset.kind in {"image", "video"}
             and normalize_issue_number(asset.issue_number)
             and _issue_key(asset.issue_number) < current_key
-            and _game_version_matches(asset.game_names, asset.version, raw_queries)
+            and _asset_matches_game_versions(asset, raw_queries)
             and (earliest is None or asset.date_suspect or asset.issue_date is None
                  or _date(asset.issue_date) is None or _date(asset.issue_date) >= earliest)
         ]
@@ -137,7 +137,7 @@ class ArchiveIndex:
         issues = sorted({_issue_key(asset.issue_number) for asset in assets}, reverse=True)[:2]
 
         # Merge local copies only when they identify the same candidate in the same issue.
-        deduped: dict[tuple[tuple[int, str], str, str], ArchiveAsset] = {}
+        deduped: dict[tuple[tuple[int, str], str, str, str], ArchiveAsset] = {}
         for asset in assets:
             issue = _issue_key(asset.issue_number)
             if issue not in issues:
@@ -145,7 +145,16 @@ class ArchiveIndex:
             meta = asset.metadata or {}
             candidate_id = meta.get("candidate_id") or meta.get("source_candidate_id") or meta.get("original_candidate_id")
             identity = str(candidate_id) if candidate_id else f"{asset.source_id}:{asset.asset_id}"
-            key = (issue, asset.kind, identity)
+            # Candidate identifiers can be reused by separate news entries. Keep
+            # those folders distinct while still merging copies of one entry.
+            news_id = meta.get("news_id")
+            if news_id:
+                news_context = "id:" + str(news_id)
+            else:
+                normalized_path = (asset.path or "").replace("\\", "/")
+                parent_path = PurePosixPath(normalized_path).parent.as_posix()
+                news_context = "path:" + _norm_name(parent_path) + ":title:" + _norm_name(asset.news_title)
+            key = (issue, asset.kind, identity, news_context)
             previous = deduped.get(key)
             if previous is None or _duplicate_rank(asset) < _duplicate_rank(previous):
                 deduped[key] = asset
@@ -153,7 +162,7 @@ class ArchiveIndex:
             deduped = {key: asset for key, asset in deduped.items() if asset.kind != "video"}
         selected = []
         for issue in issues:
-            issue_assets = [asset for (asset_issue, _kind, _identity), asset in deduped.items()
+            issue_assets = [asset for (asset_issue, _kind, _identity, _news_context), asset in deduped.items()
                             if asset_issue == issue]
             selected.extend(sorted(issue_assets, key=lambda asset: _selection_rank(asset)))
         return selected
@@ -162,23 +171,70 @@ class ArchiveIndex:
         self._db.close()
 
 
-def _game_version_matches(game_names: Iterable[str], version: str | None, queries: Iterable[str]) -> bool:
-    for game in game_names:
-        normalized_game = _norm_name(game)
-        if not normalized_game or normalized_game in {"weeklyintro", "weeklyoutro"}:
-            continue
-        for query in queries:
-            normalized_query = _norm_name(query)
-            if not version:
-                if normalized_query == normalized_game:
-                    return True
-                continue
-            normalized_version = unicodedata.normalize("NFKC", version).strip().casefold()
-            escaped_version = re.escape(normalized_version)
-            version_matches = bool(re.search(rf"(?<!\w){escaped_version}(?!\w)", query, flags=re.UNICODE))
-            if version_matches and normalized_query.startswith(normalized_game):
-                return True
+def _asset_matches_game_versions(asset: ArchiveAsset, queries: Iterable[str]) -> bool:
+    game_names = asset.game_names
+    names = tuple(str(game) for game in game_names if _norm_name(str(game)))
+    distinct_names = {_norm_name(game) for game in names}
+    if len(distinct_names) > 1:
+        # A shared news item does not establish which game a particular asset depicts.
+        # Only an asset-level assignment can make that association precise.
+        metadata = asset.metadata or {}
+        assigned = next((metadata.get(key) for key in (
+            "asset_game_name", "asset_game", "target_game", "matched_game", "game_name", "game"
+        ) if metadata.get(key)), None)
+        if assigned is None or _norm_name(str(assigned)) not in distinct_names:
+            return False
+        names = (str(assigned),)
+    for game in names:
+        context_variant = _context_variant(game, asset)
+        version = _norm_name(asset.version or "")
+        if context_variant:
+            if context_variant == "2":
+                version = "2" + version
+            elif version and version != context_variant:
+                return False
+            else:
+                version = context_variant
+        if _game_version_query_matches(game, version, queries):
+            return True
     return False
+
+
+def _game_version_query_matches(game: str, version: str | None, queries: Iterable[str]) -> bool:
+    normalized_game = _norm_name(game)
+    if not normalized_game or normalized_game in {"weeklyintro", "weeklyoutro"}:
+        return False
+    normalized_version = _norm_name(version or "")
+    for query in queries:
+        normalized_query = _norm_name(query)
+        if normalized_query == normalized_game + normalized_version:
+            return True
+    return False
+
+
+def _context_variant(game: str, asset: ArchiveAsset) -> str:
+    """Return an explicit variant qualifier following the work name, if present."""
+    normalized_game = _norm_name(game)
+    if not normalized_game:
+        return ""
+    parent_path = PurePosixPath((asset.path or "").replace("\\", "/")).parent.as_posix()
+    for context in (asset.news_title, parent_path):
+        normalized_context = _norm_name(context or "")
+        offset = normalized_context.find(normalized_game)
+        if offset < 0:
+            continue
+        suffix = normalized_context[offset + len(normalized_game):]
+        if suffix.startswith(("fandisc", "fandisk", "fd", "ファンディスク", "ファンディスク版")):
+            return "fd"
+        if suffix.startswith(("afterstory", "sequel", "アフターストーリー", "アフター", "続編")):
+            return "afterstory" if suffix.startswith(("afterstory", "アフター")) else "sequel"
+        if suffix.startswith(("remake", "remaster", "remastered", "rebuild", "reboot",
+                              "リメイク", "リマスター", "リブート", "再構築")):
+            return "remake" if suffix.startswith(("remake", "リメイク")) else "remastered"
+        # Distinguish numbered editions such as “AMBITIOUS MISSION 2 FD”.
+        if re.match(r"2(?:fd|fandisc|afterstory|sequel|remake|remaster)?", suffix):
+            return "2"
+    return ""
 
 
 def _duplicate_rank(asset: ArchiveAsset) -> tuple[int, int, str]:

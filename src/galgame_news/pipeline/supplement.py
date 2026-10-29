@@ -193,7 +193,12 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
     news_id, issue_id = str(news_id), str(issue_id)
     if not news_id or Path(news_id).name != news_id or news_id in {".", ".."} or ":" in news_id:
         raise ValueError("新闻标识不合法")
-    source_url = _normalize(str(source_url).strip())
+    from ..supplement.ledger import SupplementLedger
+    ledger_url = str(source_url).strip()
+    ledger = SupplementLedger(root)
+    source_url = _normalize(ledger_url)
+    ledger_prior = ledger.get(news_id, ledger_url) if kind == "supplement" else None
+    page_cache = ledger.get_page(ledger_url) if kind == "supplement" else None
     news, checkpoint = _news(root, issue_id, news_id, news_item, strict_checkpoint=kind == "retry")
     request = request or TaskRequest(input_path=root / "input.docx", issue_id=issue_id, output_dir=root, no_videos=True)
     if request.issue_id != issue_id:
@@ -265,7 +270,11 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
         # No search or history expansion: navigation is anchored to the extra URL.
         resolver = DefaultSourceResolver(same_domain_depth=config.search.same_domain_depth,
             search_provider=lambda item: [], history_lookup=lambda item: [])
-        if prior_sources is not None:
+        if kind == "supplement" and page_cache is not None:
+            sources = [SourceRef.model_validate(page_cache["source"])]
+        elif kind == "supplement" and ledger_prior and ledger_prior["state"] in {"completed", "no_assets", "seeded", "failed"}:
+            sources = [DefaultSourceResolver._document_source(source_url)]
+        elif prior_sources is not None:
             sources = prior_sources
         elif runner.adapter_factory is not None:
             sources = [resolver._document_source(source_url)]
@@ -286,7 +295,29 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
         attempt_root.mkdir(parents=True, exist_ok=False)
         provenance_key = "supplement_source_url" if kind == "supplement" else "retry_source_url"
         candidates = [c.model_copy(deep=True) for c in prior.values() if c.signals.get(provenance_key) == source_url] if prior_sources is not None else []
-        if not candidates:
+        cached_page_used = kind == "supplement" and page_cache is not None
+        if cached_page_used:
+            cached_candidates = []
+            for raw_candidate in page_cache.get("candidates", []):
+                record = dict(raw_candidate)
+                record["news_id"] = news_id
+                record["id"] = None
+                candidate = ImageCandidate.model_validate(record)
+                old = prior.get(candidate.id)
+                cached_candidates.append(old.model_copy(deep=True) if old and ImageDownloader.reusable(old) else candidate)
+            candidates = cached_candidates
+        terminal_no_fetch = (kind == "supplement" and ledger_prior is not None
+            and ledger_prior["state"] in {"completed", "no_assets", "seeded", "failed"})
+        if kind == "supplement" and ledger_prior and ledger_prior["state"] != "failed":
+            ledger.set_state(news_id, ledger_url, "running", detail="manual supplement reuses task page evidence")
+        if ledger_prior and ledger_prior["state"] == "failed" and kind == "supplement":
+            failures.append(FailureRecord(stage=FailureStage.COLLECT, news_id=news_id,
+                code="supplement_source_previously_failed", message="该链接此前处理失败；请使用重试操作重新抓取",
+                source_url=source_url, retryable=True))
+            status = "failed"
+        elif not cached_page_used and not terminal_no_fetch and not candidates:
+            if kind == "supplement":
+                ledger.set_state(news_id, ledger_url, "running", detail="manual supplement collection")
             emit("正在采集补充图片…")
             collections = await runtime.collect_many(news, sources, request)
             by_id = {}
@@ -303,6 +334,8 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
                     existing = prior.get(candidate.id)
                     by_id[candidate.id] = existing.model_copy(deep=True) if existing and ImageDownloader.reusable(existing) else candidate
             candidates = list(by_id.values())
+        if not cached_page_used and not terminal_no_fetch:
+            ledger.set_page(ledger_url, sources[0], candidates)
         for candidate in candidates:
             candidate.signals[provenance_key] = source_url
             candidate.signals[f"{kind}_attempt_id"] = attempt_id
@@ -316,8 +349,9 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
                 failures.append(failure)
             save()
             emit("补充图片下载处理中…")
-        if pending:
+        if pending and not terminal_no_fetch:
             await runtime.download(pending, attempt_root / "images", on_result=on_result)
+            ledger.set_page(ledger_url, sources[0], candidates)
         if kind == "retry":
             from .goods_collection import search_goods_after_download
             emit("正在检查高清商品图并补搜来源…")
@@ -397,6 +431,12 @@ async def collect_supplement(runner, *, task_root, issue_id, news_id, source_url
                 elif status == "completed" and (failures or any(c.download_status != "downloaded" for c in candidates)):
                     status = "partial"
                 save()
+                ledger_state = ("no_assets" if status == "completed" and not candidates else status)
+                if ledger_state not in {"completed", "partial", "failed", "cancelled", "no_assets"}:
+                    ledger_state = "failed"
+                canonical = sources[0].url if sources and _normalize(sources[0].url) != source_url else None
+                ledger.set_state(news_id, ledger_url, ledger_state, redirect_url=canonical,
+                    detail=f"manual {kind} collection attempt {attempt_id}")
         finally:
             try:
                 try:

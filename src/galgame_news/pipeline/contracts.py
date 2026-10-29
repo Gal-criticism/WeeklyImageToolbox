@@ -165,10 +165,25 @@ class TaskRequest:
     images_only: bool = False
     use_archive_materials: bool = False
     archive_range: Literal["year", "all"] = "year"
+    use_image_supplement: bool = False
+    supplement_target_images: int = 5
+    supplement_sources: tuple[str, ...] = ("official", "store", "ymgal", "vndb")
 
     def __post_init__(self) -> None:
         if self.archive_range not in ("year", "all"):
             raise ValueError("往期周报范围仅支持最近一年或全部周报")
+        if isinstance(self.supplement_target_images, bool) or not isinstance(self.supplement_target_images, int) or self.supplement_target_images <= 0:
+            raise ValueError("补图目标数量必须是正整数")
+        if self.offline and self.use_image_supplement:
+            raise ValueError("离线模式不能启用联网自动补图")
+        if self.use_image_supplement:
+            allowed_sources = ("official", "store", "ymgal", "vndb")
+            if not isinstance(self.supplement_sources, (list, tuple, set, frozenset)):
+                raise ValueError("自动补图来源必须至少选择一项：官网、商店、Ymgal 或 VNDB")
+            selected_sources = set(self.supplement_sources)
+            if not selected_sources or selected_sources - set(allowed_sources):
+                raise ValueError("自动补图来源必须至少选择一项：官网、商店、Ymgal 或 VNDB")
+            self.supplement_sources = tuple(value for value in allowed_sources if value in selected_sources)
         if not isinstance(self.selected_sections, (list, tuple, set, frozenset)):
             raise ValueError("抓取栏目必须是新作、汉化、周边的选择列表")
         if not self.selected_sections:

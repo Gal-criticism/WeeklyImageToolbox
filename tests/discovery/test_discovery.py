@@ -285,12 +285,21 @@ def test_ddgs_provider_accepts_current_href_and_body_field_names():
 
     provider = DDGSSearchProvider(
         search_fn=lambda query, **_: [
-            {"title": "Official game site", "href": "https://official.example/game", "body": "Gallery and news"}
+            {"title": "Happy Weekend official visual novel game", "href": "https://official.example/game", "body": "Happy Weekend gallery"}
         ]
     )
     result = provider.search(item())
     assert [source.url for source in result] == ["https://official.example/game"]
     assert result[0].source_type is SourceType.UNVERIFIED
+
+
+def test_ddgs_provider_rejects_generic_game_result_without_work_identity():
+    from galgame_news.discovery.search import DDGSSearchProvider
+
+    provider = DDGSSearchProvider(search_fn=lambda query, **_: [
+        {"title": "Official game site", "href": "https://official.example/game", "body": "Gallery and news"}
+    ])
+    assert provider.search(item()) == []
 
 
 def test_ddgs_provider_expands_explicit_cg_updates_with_gallery_search_terms():
@@ -300,7 +309,8 @@ def test_ddgs_provider_expands_explicit_cg_updates_with_gallery_search_terms():
 
     def search(query, **_):
         calls.append(query)
-        return [{"title": query, "href": f"https://search.example/result-{len(calls)}", "body": "CG gallery"}]
+        return [{"title": f"One Night After official visual novel game {query}",
+                 "href": f"https://search.example/result-{len(calls)}", "body": "CG gallery"}]
 
     provider = DDGSSearchProvider(search_fn=search, max_results=5)
     result = provider.search(item(
@@ -350,25 +360,21 @@ def test_default_fallback_search_does_not_use_brave_environment_key(monkeypatch)
 
 
 def test_ddgs_provider_passes_bounded_timeout_to_client(monkeypatch):
-    from types import SimpleNamespace
-    import sys
     from galgame_news.discovery.search import DDGSSearchProvider
 
     seen = {}
+    def fake_worker(queries, max_results, timeout):
+        seen.update(queries=queries, max_results=max_results, timeout=timeout)
+        return [{"href": "https://official.example/game", "title": "Happy Weekend visual novel game",
+                 "body": "Happy Weekend official gallery"}]
 
-    class FakeDDGS:
-        def __init__(self, **kwargs):
-            seen.update(kwargs)
-
-        def text(self, query, **kwargs):
-            return [{"href": "https://official.example/game", "title": "game"}]
-
-    monkeypatch.setitem(sys.modules, "ddgs", SimpleNamespace(DDGS=FakeDDGS))
+    monkeypatch.setattr("galgame_news.discovery.search._run_ddgs_subprocess", fake_worker)
     provider = DDGSSearchProvider(timeout=2.5, max_results=3)
     result = provider.search(item())
 
     assert result[0].url == "https://official.example/game"
     assert seen["timeout"] == 2.5
+    assert seen["max_results"] == 3
 
 
 def test_wix_embedded_dynamic_data_yields_original_media_images(monkeypatch):

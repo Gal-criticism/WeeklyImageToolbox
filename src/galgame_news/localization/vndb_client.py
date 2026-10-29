@@ -91,7 +91,7 @@ class VNDBClient(SkillVNDBClient):
     def vn(self, vn_id: str, news_id: str = "") -> dict[str, Any] | None:
         return self._query("vn", {
             "filters": ["id", "=", vn_id],
-            "fields": "id,title,alttitle,titles.title,titles.latin,screenshots{id,url,dims,thumbnail,thumbnail_dims,release.id},relations{id,title,alttitle,relation,relation_official}",
+            "fields": "id,title,alttitle,titles.title,titles.latin,rating,votecount,screenshots{id,url,dims,thumbnail,thumbnail_dims,release.id,sexual,violence,votecount},relations{id,title,alttitle,relation,relation_official}",
             "results": 1,
         }, vn_id, news_id)
 

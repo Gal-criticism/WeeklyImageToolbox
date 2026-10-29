@@ -108,6 +108,7 @@ def discover_html_video_urls(
     page_url: str,
     *,
     include_anchor_links: bool = True,
+    primary_content_only: bool = False,
 ) -> list[str]:
     """Extract explicit video tags/links and recognized embeds.
 
@@ -115,20 +116,41 @@ def discover_html_video_urls(
     arbitrary navigation anchors must never become post entities.
     """
     soup = BeautifulSoup(html or "", "html.parser")
+    excluded = {"nav", "footer", "aside", "script", "style", "noscript"}
+
+    def in_non_primary(node) -> bool:
+        if not primary_content_only:
+            return False
+        while node is not None and getattr(node, "name", None):
+            if node.name in excluded:
+                return True
+            marker = " ".join([str(node.get("id") or ""), " ".join(node.get("class") or []),
+                               str(node.get("aria-label") or ""), str(node.get("data-testid") or "")]).casefold()
+            if any(word in marker for word in ("recommend", "related", "suggest", "advert", "sponsor", "sidebar", "popular")):
+                return True
+            node = node.parent
+        return False
+
     raw_values: list[str] = []
     for tag in soup.find_all(("video", "source")):
+        if in_non_primary(tag):
+            continue
         for attr in ("src", "data-src"):
             if tag.get(attr):
                 raw_values.append(tag[attr])
     for tag in soup.find_all("iframe", src=True):
+        if in_non_primary(tag):
+            continue
         raw_values.append(tag["src"])
     if include_anchor_links:
         for tag in soup.find_all("a", href=True):
+            if in_non_primary(tag):
+                continue
             href = tag["href"]
             if is_video_url(urljoin(page_url, href)):
                 raw_values.append(href)
     # Some pages serialize an iframe/video URL in JSON-LD or application state.
-    for script in soup.find_all("script", type="application/ld+json"):
+    for script in (() if primary_content_only else soup.find_all("script", type="application/ld+json")):
         try:
             payload = json.loads(script.string or script.get_text())
         except (TypeError, ValueError, json.JSONDecodeError):

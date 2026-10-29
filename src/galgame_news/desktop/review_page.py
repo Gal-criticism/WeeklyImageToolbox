@@ -9,12 +9,13 @@ from typing import Any
 from PySide6.QtCore import QElapsedTimer, QEvent, QPoint, QSize, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QDesktopServices, QIcon, QImage, QKeyEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
+    QAbstractItemView, QComboBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
     QPushButton, QCheckBox, QScrollArea, QSplitter, QTabWidget, QTextEdit, QToolButton,
     QVBoxLayout, QWidget, QStackedWidget,
 )
 
 from ..review import ReviewDecision, ReviewSession
+from ..domain import ImageType
 from .async_export import AsyncExport
 from .async_images import AsyncImages, ImageRequest
 from .i18n import code, image_type_label, reason_label, status_label
@@ -31,6 +32,8 @@ class ReviewPage(QWidget):
     retry_requested = Signal(str)
     supplement_requested = Signal(str, str)
     supplement_cancel_requested = Signal()
+    supplement_adopt_requested = Signal(object)
+    supplement_run_requested = Signal(str)
     news_changed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None):
@@ -91,7 +94,7 @@ class ReviewPage(QWidget):
         self.news_list.currentItemChanged.connect(self._news_item_changed)
         self.tabs = QTabWidget()
         self.tabs.setObjectName("reviewTabs")
-        for label in ("已选", "未候选／待复核", "往期周报", "已排除", "视频"):
+        for label in ("已选", "未候选／待复核", "往期周报", "补图候选", "已排除", "视频"):
             self.tabs.addTab(QWidget(), label)
         self.tabs.setCurrentIndex(1)
         self.tabs.setMaximumHeight(48)
@@ -119,6 +122,30 @@ class ReviewPage(QWidget):
         self.media_stack = QStackedWidget()
         self.media_stack.addWidget(self.media_list)
         self.media_stack.addWidget(self.archive_panel)
+        self.supplement_adopt_button = QPushButton("采用所选补图")
+        self.supplement_adopt_button.clicked.connect(self.adopt_selected_supplements)
+        self.supplement_adopt_button.setVisible(False)
+        self.supplement_classification = QComboBox()
+        self.supplement_classification.setObjectName("supplementClassificationCombo")
+        for image_type in ImageType:
+            self.supplement_classification.addItem(image_type_label(image_type), image_type.value)
+        self.supplement_classification.setVisible(False)
+        self.supplement_classification.currentIndexChanged.connect(self._supplement_classification_changed)
+        self.supplement_actions = QWidget()
+        supplement_actions_layout = QHBoxLayout(self.supplement_actions)
+        supplement_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.supplement_current_button = QPushButton("补当前新闻")
+        self.supplement_all_button = QPushButton("补全部不足项")
+        self.supplement_continue_button = QPushButton("继续补图")
+        self.supplement_retry_failed_button = QPushButton("重试失败项")
+        self.supplement_actions_cancel = QPushButton("取消")
+        for button, action in ((self.supplement_current_button, "current"), (self.supplement_all_button, "all"),
+                               (self.supplement_continue_button, "continue"), (self.supplement_retry_failed_button, "retry_failed")):
+            supplement_actions_layout.addWidget(button)
+            button.clicked.connect(lambda _checked=False, value=action: self.supplement_run_requested.emit(value))
+        supplement_actions_layout.addWidget(self.supplement_actions_cancel)
+        self.supplement_actions_cancel.clicked.connect(self.supplement_cancel_requested.emit)
+        self.supplement_actions.setVisible(False)
         self.grid_summary = QLabel("尚未加载媒体")
         self.grid_summary.setObjectName("muted")
         self.preview = QLabel("载入抓取结果后，在中间选择媒体")
@@ -217,6 +244,7 @@ class ReviewPage(QWidget):
         grid_layout.setContentsMargins(0, 0, 0, 0)
         grid_layout.addWidget(self.tabs)
         grid_layout.addWidget(self.grid_summary)
+        grid_layout.addWidget(self.supplement_actions)
         grid_layout.addWidget(self.media_stack, 1)
         grid_layout.addWidget(self.selection_label)
         # Keep long evidence and expanded raw diagnostics inside the pane's
@@ -242,6 +270,8 @@ class ReviewPage(QWidget):
             for button in buttons:
                 actions.addWidget(button)
             details.addLayout(actions)
+        details.addWidget(self.supplement_adopt_button)
+        details.addWidget(self.supplement_classification)
         details.addWidget(self.metadata)
         details.addWidget(self.raw_toggle)
         details.addWidget(self.raw_details)
@@ -379,7 +409,9 @@ class ReviewPage(QWidget):
         if self.session is None:
             return []
         index, news_id = self.tabs.currentIndex(), self._news_filter()
-        if index == 2:
+        if index in (2, 3):
+            if index == 3:
+                return [c for c in self.session.supplement_candidates(news_id) if not section or section_prefix(str(self._news.get(str(c.news_id), {}).get("section", ""))) == section]
             return []
         section = self._selected_section()
         if section:
@@ -387,19 +419,19 @@ class ReviewPage(QWidget):
             if index == 0:
                 candidates = self.session.accepted_images()
                 return [c for c in candidates if str(c.news_id) in allowed]
-            if index == 3:
+            if index == 4:
                 candidates = self.session.rejected_images()
                 return [c for c in candidates if str(c.news_id) in allowed]
-            if index == 4:
+            if index == 5:
                 candidates = [*self.session.accepted_videos(), *self.session.pending_videos()]
                 return [c for c in candidates if str(c.news_id) in allowed]
             candidates = self.session.pending_images()
             return [c for c in candidates if str(c.news_id) in allowed]
         if index == 0:
             return list(self.session.accepted_images(news_id))
-        if index == 3:
-            return list(self.session.rejected_images(news_id))
         if index == 4:
+            return list(self.session.rejected_images(news_id))
+        if index == 5:
             return [*self.session.accepted_videos(news_id), *self.session.pending_videos(news_id)]
         return list(self.session.pending_images(news_id))
 
@@ -480,6 +512,8 @@ class ReviewPage(QWidget):
         section = self._selected_section()
         tab = self.tabs.currentIndex()
         self.media_stack.setCurrentWidget(self.archive_panel if tab == 2 else self.media_list)
+        self.supplement_actions.setVisible(tab == 3 and getattr(self, "_supplement_enabled", False))
+        self.supplement_adopt_button.setVisible(tab == 3)
         view = (id(session), news_id, section, tab)
         scroll_value = self.media_list.verticalScrollBar().value() if preserve_scroll else 0
         previous = str(self._selected().id) if self._selected() else ""
@@ -540,8 +574,10 @@ class ReviewPage(QWidget):
         if tab == 0:
             values = list(snapshot.accepted_images(news_id))
         elif tab == 3:
-            values = list(snapshot.rejected_images(news_id))
+            values = list(snapshot.supplement_candidates(news_id))
         elif tab == 4:
+            values = list(snapshot.rejected_images(news_id))
+        elif tab == 5:
             values = [*snapshot.accepted_videos(news_id), *snapshot.pending_videos(news_id)]
         elif tab == 2:
             values = []
@@ -739,11 +775,25 @@ class ReviewPage(QWidget):
         decision = status_label(self.session.decision(str(candidate.id))) if self.session else ""
         localization_summary = self._localization_summary(candidate)
         archive_summary = self._archive_provenance_summary(candidate)
+        supplement_info = ""
+        if (signals or {}).get("supplement_module"):
+            supplement_info = "\n补图来源：" + str((signals or {}).get("supplement_source", getattr(candidate, "source_url", "未知")))
+            relation = (signals or {}).get("supplement_relation") or (signals or {}).get("supplement_type")
+            if relation:
+                supplement_info += "\n作品关联/素材类型：" + str(relation)
+            self.supplement_classification.blockSignals(True)
+            classification_index = self.supplement_classification.findData(code(getattr(candidate, "image_type", "unknown")))
+            self.supplement_classification.setCurrentIndex(max(0, classification_index))
+            self.supplement_classification.blockSignals(False)
+            self.supplement_classification.setVisible(self.tabs.currentIndex() == 3)
+        else:
+            self.supplement_classification.setVisible(False)
         self.metadata.setText(f"{self._title(candidate)[:180]}\n{kind} · {decision} · {getattr(candidate, 'width', None) or '—'} × {getattr(candidate, 'height', None) or '—'}"
                               + (f" · 评分 {score:.1f}" if score is not None else "")
                               + (f"\n{' · '.join(self._badges(candidate))}" if self._badges(candidate) else "")
                               + (f"\n{localization_summary}" if localization_summary else "")
                               + (f"\n{archive_summary}" if archive_summary else "")
+                              + supplement_info
                               + f"\n复核依据：{reason_text}")
         payload = candidate.model_dump(mode="json") if hasattr(candidate, "model_dump") else {"id": str(candidate.id)}
         payload["resolved_local_path"] = str(path) if path else None
@@ -759,7 +809,8 @@ class ReviewPage(QWidget):
         self.supplement_button.setEnabled(bool(self._news_filter()) and not self._supplement_busy and self.exporter.session is not self.session)
         self.retry_button.setEnabled(bool(candidate.news_id) and not self._supplement_busy and self.exporter.session is not self.session)
         for button in (self.accept_button, self.reject_button, self.pending_button):
-            button.setEnabled(self.exporter.session is not self.session)
+            button.setEnabled(self.exporter.session is not self.session and self.tabs.currentIndex() != 3)
+        self.supplement_adopt_button.setEnabled(self.tabs.currentIndex() == 3 and not self._supplement_busy and self.exporter.session is not self.session)
         for button in (self.zoom_in_button, self.zoom_out_button, self.zoom_reset_button):
             button.setEnabled(bool(path and not is_video))
 
@@ -917,7 +968,7 @@ class ReviewPage(QWidget):
             if str(candidate.id) not in changed_ids:
                 continue
             is_video = bool(getattr(candidate, "video_url", None))
-            remains = (tab == 0 and decision is ReviewDecision.ACCEPTED) or (tab == 3 and decision is ReviewDecision.REJECTED) or (tab == 1 and decision is ReviewDecision.PENDING) or (tab == 4 and is_video and decision in {ReviewDecision.ACCEPTED, ReviewDecision.PENDING})
+            remains = (tab == 0 and decision is ReviewDecision.ACCEPTED) or (tab == 4 and decision is ReviewDecision.REJECTED) or (tab == 1 and decision is ReviewDecision.PENDING) or (tab == 5 and is_video and decision in {ReviewDecision.ACCEPTED, ReviewDecision.PENDING}) or (tab == 3 and bool((getattr(candidate, "signals", {}) or {}).get("supplement_module")))
             if not remains:
                 moved.add(str(candidate.id))
         if not moved:
@@ -1034,12 +1085,18 @@ class ReviewPage(QWidget):
         return [self._items[row] for row in rows if 0 <= row < len(self._items)]
 
     def accept_selected(self) -> None:
+        if self.tabs.currentIndex() == 3:
+            return
         self._set_selected_decision(ReviewDecision.ACCEPTED)
 
     def reject_selected(self) -> None:
+        if self.tabs.currentIndex() == 3:
+            return
         self._set_selected_decision(ReviewDecision.REJECTED)
 
     def pending_selected(self) -> None:
+        if self.tabs.currentIndex() == 3:
+            return
         self._set_selected_decision(ReviewDecision.PENDING)
 
     def _source_url(self, candidate: Any) -> str:
@@ -1149,6 +1206,39 @@ class ReviewPage(QWidget):
         self.set_supplement_busy(True)
         self.supplement_requested.emit(str(news_id), url.toString())
 
+    def adopt_selected_supplements(self) -> None:
+        if not self.session or self.tabs.currentIndex() != 3 or self._supplement_busy:
+            return
+        values = [str(candidate.id) for candidate in self._selected_candidates()
+                  if (getattr(candidate, "signals", {}) or {}).get("supplement_module")]
+        if not values and len(self._items) == 1:
+            values = [str(self._items[0].id)]
+        if values:
+            self.supplement_adopt_requested.emit(values)
+
+    def _supplement_classification_changed(self, index: int) -> None:
+        candidate = self._selected()
+        if (index < 0 or candidate is None or self.tabs.currentIndex() != 3
+                or not (getattr(candidate, "signals", {}) or {}).get("supplement_module")
+                or self.session is None):
+            return
+        try:
+            self.session.set_supplement_classification(str(candidate.id), self.supplement_classification.currentData(), persist=False)
+            self.state_writer.enqueue(self.session)
+            self.operation_status.setText("补图分类已更正并保存")
+            self.refresh(preserve_position=True)
+        except (KeyError, ValueError) as exc:
+            self.show_diagnostics([diagnose_error(exc, stage="更正补图分类")])
+
+    def set_supplement_controls(self, enabled: bool) -> None:
+        self._supplement_enabled = bool(enabled)
+        self.supplement_actions.setVisible(self.tabs.currentIndex() == 3 and self._supplement_enabled)
+
+    def _selected_candidates(self) -> list[Any]:
+        return [self._row_candidate_by_id[str(item.data(Qt.ItemDataRole.UserRole))]
+                for item in self.media_list.selectedItems()
+                if str(item.data(Qt.ItemDataRole.UserRole)) in self._row_candidate_by_id]
+
     def set_supplement_busy(self, busy: bool) -> None:
         self._supplement_busy = bool(busy)
         self.supplement_url_edit.setEnabled(not self._supplement_busy)
@@ -1158,6 +1248,10 @@ class ReviewPage(QWidget):
         self.retry_button.setEnabled(bool(self.session and (candidate or self._news_filter())) and not self._supplement_busy and self.exporter.session is not self.session)
         self.export_button.setEnabled(bool(self.session and not self._supplement_busy and self.exporter.session is None))
         self.supplement_cancel_button.setEnabled(self._supplement_busy)
+        for button in (self.supplement_current_button, self.supplement_all_button,
+                       self.supplement_continue_button, self.supplement_retry_failed_button):
+            button.setEnabled(not self._supplement_busy and self.exporter.session is not self.session)
+        self.supplement_adopt_button.setEnabled(self.tabs.currentIndex() == 3 and not self._supplement_busy)
 
     def show_supplement_result(self, result: Any) -> None:
         if isinstance(result, dict):

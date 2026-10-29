@@ -213,6 +213,12 @@ class OutputManager:
         )
 
     def write(self, result: PipelineResult, output_dir: Path | str) -> OutputManifest:
+        # Automatic supplement assets remain a separate review pool until adopted.
+        for candidate in result.all_candidates:
+            if candidate.signals.get("supplement_module") and not candidate.signals.get("supplement_adopted"):
+                candidate.selected = False
+                if candidate.curation_status is not ImageCurationStatus.INVALID:
+                    candidate.curation_status = ImageCurationStatus.UNSELECTED
         root = Path(output_dir)
         root.mkdir(parents=True, exist_ok=True)
         image_root = root / "images"

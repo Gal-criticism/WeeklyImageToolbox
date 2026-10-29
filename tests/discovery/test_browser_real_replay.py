@@ -63,11 +63,14 @@ def test_real_browser_discovers_images_and_routes_only_through_public_client():
     asyncio.run(run())
 
 
-def test_default_pipeline_renders_downloads_and_publishes_dynamic_gallery(tmp_path):
+@pytest.mark.parametrize("supplement_mode", [False, True])
+def test_default_pipeline_renders_downloads_and_publishes_dynamic_gallery(tmp_path, supplement_mode):
     if not check_browser_runtime().available:
         pytest.skip("可选 Chromium 运行环境未安装")
     news = NewsItem(issue_id="263", sequence=1, section="新作", title="Example Game CG 更新", body="CG", game_names=["Example Game"],source_urls=[PAGE])
-    ref = SourceRef(url=PAGE,root_url=PAGE,domain="gallery.example",source_type=SourceType.OFFICIAL_SITE,officiality=1)
+    ref = SourceRef(url=PAGE,root_url=PAGE,domain="gallery.example",
+        source_type=SourceType.UNVERIFIED if supplement_mode else SourceType.OFFICIAL_SITE,
+        officiality=0.4 if supplement_mode else 1)
     path=tmp_path/"fixture.docx"
     path.write_bytes(b"frozen pipeline fixture")
     class Parser:
@@ -87,6 +90,7 @@ def test_default_pipeline_renders_downloads_and_publishes_dynamic_gallery(tmp_pa
         return SimpleNamespace(content=output.getvalue(),url=url,status_code=200,headers={"content-type":"image/png"})
     class FixtureRunner(PipelineRunner):
         async def _run_async_body(self,*args):
+            self._supplement_mode = supplement_mode
             self._network_runtime.page_client.resolver=lambda _: ["8.8.8.8"]
             self._network_runtime.image_client.resolver=lambda _: ["8.8.8.8"]
             return await super()._run_async_body(*args)
@@ -96,7 +100,11 @@ def test_default_pipeline_renders_downloads_and_publishes_dynamic_gallery(tmp_pa
     photos={c.image_url:c for c in result.result.all_candidates}
     for filename in ("one.png","two.png","three.png"):
         c=photos[PAGE+filename]
-        assert c.selected and c.download_status == "downloaded"
+        assert c.download_status == "downloaded"
+        if not supplement_mode:
+            assert c.selected
+        else:
+            assert c.source_type is SourceType.UNVERIFIED
         assert c.evidence[0].method == "browser"
         with Image.open(c.local_path) as image:
             image.load()

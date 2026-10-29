@@ -51,8 +51,9 @@ def test_review_archive_tab_is_third_and_has_separate_panel(qtbot):
 
     assert page.tabs.tabText(2) == "往期周报"
     assert page.archive_panel is not None
-    assert page.tabs.tabText(3) == "已排除"
-    assert page.tabs.tabText(4) == "视频"
+    assert page.tabs.tabText(3) == "补图候选"
+    assert page.tabs.tabText(4) == "已排除"
+    assert page.tabs.tabText(5) == "视频"
 
 
 def test_archive_tab_never_uses_ordinary_review_candidates():

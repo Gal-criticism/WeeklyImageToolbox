@@ -253,6 +253,8 @@ class SourceRef(ContractModel):
     navigation_text: str = ""
     navigation_depth: int = Field(default=0, ge=0)
     source_chain: list[str] = Field(default_factory=list)
+    search_title: str = ""
+    search_snippet: str = ""
 
 
 class ScoreBreakdown(ContractModel):

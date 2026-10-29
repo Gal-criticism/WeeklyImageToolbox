@@ -24,6 +24,48 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_dns_workers_cannot_hold_process_exit_after_request_timeout():
+    import threading
+
+    async def scenario():
+        release = threading.Event()
+
+        def blocked(_host):
+            release.wait(3)
+            return ["93.184.216.34"]
+
+        client = AsyncHttpClient(timeout=0.02, resolver=blocked, concurrency=1)
+        try:
+            with pytest.raises(httpx.TimeoutException):
+                await client.get("https://public.example/")
+            await asyncio.wait_for(client.close(), 0.2)
+            assert all(thread.daemon for thread in client._executor._threads)
+        finally:
+            release.set()
+
+    run(scenario())
+
+
+def test_response_body_read_obeys_timeout(tmp_path):
+    class StalledBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await asyncio.sleep(10)
+            yield b"never"
+
+    async def scenario():
+        client = AsyncHttpClient(resolver=PUBLIC, timeout=0.02, max_retries=1)
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=StalledBody())))
+        try:
+            with pytest.raises(httpx.TimeoutException):
+                await asyncio.wait_for(client.download(
+                    "https://public.example/image", tmp_path / "body.part"), 0.3)
+        finally:
+            await client.close()
+
+    run(scenario())
+
+
 def test_exhausted_http_error_is_not_cached_and_later_request_recovers():
     async def scenario():
         calls = []
@@ -272,6 +314,81 @@ def test_dns_resolution_does_not_block_event_loop():
             asyncio.get_running_loop().call_later(0.02, heartbeat.set)
             await asyncio.wait_for(heartbeat.wait(), 0.06)
             await task
+
+    run(scenario())
+
+
+def test_dns_validation_obeys_network_timeout_and_releases_blocked_resolver():
+    import threading
+    import time
+
+    async def scenario():
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_resolver(_host):
+            entered.set()
+            release.wait()
+            return ["93.184.216.34"]
+
+        client = AsyncHttpClient(timeout=0.02, resolver=blocked_resolver)
+        task = asyncio.create_task(client._validate_url("https://public.example/"))
+        try:
+            assert await asyncio.to_thread(entered.wait, 0.2)
+            started = time.monotonic()
+            with pytest.raises(httpx.TimeoutException):
+                await asyncio.wait_for(task, timeout=0.3)
+            assert time.monotonic() - started < 0.2
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await client.close()
+
+    run(scenario())
+
+
+def test_transport_timeout_does_not_wait_for_cancellation_cleanup_forever():
+    import time
+
+    async def scenario():
+        client = AsyncHttpClient(timeout=0.02, resolver=PUBLIC)
+        cancellation_seen = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        task_holder = []
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+
+        async def cancellation_resistant():
+            task_holder.append(asyncio.current_task())
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                try:
+                    await release_cleanup.wait()
+                finally:
+                    cleanup_finished.set()
+                raise RuntimeError("late cleanup failure")
+
+        started = time.monotonic()
+        try:
+            with pytest.raises(httpx.TimeoutException):
+                await asyncio.wait_for(client._wait(cancellation_resistant(), timeout=0.02), timeout=0.12)
+            assert time.monotonic() - started < 0.11
+            assert cancellation_seen.is_set()
+            assert task_holder and not task_holder[0].done()
+            release_cleanup.set()
+            await asyncio.wait_for(cleanup_finished.wait(), timeout=0.2)
+            await asyncio.sleep(0)
+            assert task_holder[0].done()
+        finally:
+            release_cleanup.set()
+            loop.set_exception_handler(old_handler)
+            await client.close()
+        assert not loop_errors
 
     run(scenario())
 

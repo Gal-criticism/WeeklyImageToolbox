@@ -132,4 +132,29 @@ class ReviewGrabWorker(QObject):
         except BaseException as exc:
             self.failed.emit((self.identity, exc))
 
-__all__ = ["PipelineWorker", "TaskWorker", "SupplementWorker", "ReviewGrabWorker"]
+
+class SupplementMissingWorker(QObject):
+    """Run automatic multi-source supplement without touching review widgets."""
+    event = Signal(object)
+    finished = Signal(object)
+    failed = Signal(object)
+
+    def __init__(self, runner, kwargs, token, identity):
+        super().__init__()
+        self.runner, self.kwargs, self.token, self.identity = runner, kwargs, token, identity
+
+    @Slot()
+    def run(self):
+        try:
+            from ..supplement.service import supplement_missing
+            values = supplement_missing(self.runner, **self.kwargs, event_sink=self.event.emit,
+                                        cancellation_token=self.token)
+            if hasattr(values, "__await__"):
+                import asyncio
+                values = asyncio.run(values)
+        except BaseException as exc:
+            self.failed.emit((self.identity, exc))
+        else:
+            self.finished.emit((self.identity, values))
+
+__all__ = ["PipelineWorker", "TaskWorker", "SupplementWorker", "ReviewGrabWorker", "SupplementMissingWorker"]

@@ -65,6 +65,10 @@ class _NoSelectedNewsItemsError(_NoNewsItemsError):
     """The document has news, but none in the requested sections."""
 
 
+class _NewsWatchdogTimeout(TimeoutError):
+    """A per-news stage exceeded its configured deadline."""
+
+
 class PipelineRunner:
     """Run one task with isolated output and strict resumable checkpoints."""
 
@@ -113,7 +117,7 @@ class PipelineRunner:
             same_domain_depth=config.search.same_domain_depth,
             same_domain_transport=self.source_transport,
             search_max_results=config.search.max_results,
-            search_timeout=config.network.timeout_seconds,
+            search_timeout=config.network.search_timeout_seconds,
         )
 
     def run(self, request, event_sink=None, cancellation_token=None) -> TaskResult:
@@ -162,11 +166,56 @@ class PipelineRunner:
         )
         return result
 
+    @staticmethod
+    async def _await_with_news_watchdog(awaitable, timeout: float, token):
+        """Bound one news item while excluding deliberate pause time."""
+        task = asyncio.create_task(awaitable)
+        remaining = timeout
+        try:
+            while not task.done():
+                interval = 0.05 if token.is_paused else min(0.1, remaining)
+                started = time.monotonic()
+                await asyncio.wait({task}, timeout=interval)
+                elapsed = time.monotonic() - started
+                if not token.is_paused:
+                    remaining -= elapsed
+                if remaining <= 0 and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise _NewsWatchdogTimeout(
+                        f"单条新闻处理超过 {timeout:g} 秒"
+                    )
+            return task.result()
+        except BaseException:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    async def _run_persistence(self, operation):
+        """Serialize durable state writes on the pool reserved for persistence."""
+        runtime = self._network_runtime
+        future = runtime.loop.run_in_executor(runtime.persistence, operation)
+        timeout = max(5.0, self.config.network.timeout_seconds)
+        try:
+            await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        except asyncio.CancelledError:
+            # Cancel queued work if possible; a running atomic write may finish
+            # in its daemon worker after this task has unwound.
+            future.cancel()
+            raise
+
+    def _publication_timeout_seconds(self) -> float:
+        """Give publication a bounded budget independent of one HTTP request."""
+        return max(180.0, 3.0 * self.config.network.news_timeout_seconds)
+
     async def run_async(self, request, event_sink=None, cancellation_token=None) -> TaskResult:
         from .network_runtime import TaskNetworkRuntime
         if self._network_runtime is not None:
             raise RuntimeError("A PipelineRunner cannot run overlapping tasks")
         token = cancellation_token or CancellationToken()
+        old_supplement_enabled = getattr(self, "_image_supplement_enabled", False)
+        self._image_supplement_enabled = bool(getattr(request, "use_image_supplement", False))
         try:
             self._activate_config(self._config_for_request(request))
         except Exception:
@@ -181,6 +230,21 @@ class PipelineRunner:
             self.network_metrics = runtime.stats()
             await runtime.close()
             self._network_runtime = None
+            self._image_supplement_enabled = old_supplement_enabled
+        # Automatic image supplementation is a separate pass: it must begin only
+        # after the ordinary task runtime has fully released its clients.
+        if (getattr(request, "use_image_supplement", False)
+                and result.status in {"completed", "partial"}
+                and result.pipeline_result.issue.news_items):
+            try:
+                from ..supplement.service import supplement_missing
+                await supplement_missing(self, task_root=result.task_dir,
+                    issue=result.pipeline_result.issue, request=request,
+                    event_sink=event_sink, cancellation_token=token)
+            except Exception as exc:
+                self._emit(event_sink or (lambda _event: None), result.pipeline_result.failures,
+                    self._event("supplement_failed", result.task_id, request.issue_id,
+                        message=f"图片补充失败（{type(exc).__name__}）"))
         # Full assets and indexes remain available for review and recovery.
         return result
 
@@ -286,7 +350,10 @@ class PipelineRunner:
                         raise ValueError("completed checkpoint has no result")
                     self._emit(sink, failures, self._event("x_media_stats", task_id, issue.issue_id, payload=self._x_media_payload(candidates)))
                     if not self._legacy_output and raw_dir.is_dir():
-                        await self._network_runtime.call_sync(lambda: self._export_review_delivery(raw_dir, task_dir))
+                        await self._network_runtime.call_sync(
+                            lambda: self._export_review_delivery(raw_dir, task_dir),
+                            timeout=self._publication_timeout_seconds(),
+                        )
                     return TaskResult(
                         status="completed", task_id=task_id, task_dir=task_dir,
                         output_dir=raw_dir, checkpoint_path=checkpoint_path,
@@ -322,7 +389,7 @@ class PipelineRunner:
                 failure = self._failure("input_missing", (str(exc).strip() or f"执行失败（{type(exc).__name__}）"))
             failures.append(failure)
             result = self._pipeline_result(issue, candidates, videos, failures)
-            return self._failed_result(
+            return await self._failed_result(
                 request, task_id or request.task_id or request.issue_id,
                 task_dir, raw_dir, checkpoint_path, result, failures, sink, resumed,
             )
@@ -333,7 +400,7 @@ class PipelineRunner:
         try:
             await token.wait_if_paused_async()
         except (CancellationRequested, asyncio.CancelledError):
-            return self._cancel(
+            return await self._cancel(
                 request, task_id, task_dir, raw_dir, checkpoint_path, issue,
                 input_hash, config_hash, completed, candidates, videos, failures,
                 source_map, sink, resumed,
@@ -389,14 +456,14 @@ class PipelineRunner:
                              "document_news_count": original_news_count},
                 ))
                 await token.wait_if_paused_async()
-                self._write_checkpoint(
+                await self._run_persistence(lambda: self._write_checkpoint(
                     checkpoint_path, status="running", task_id=task_id, issue=issue,
                     input_hash=input_hash, config_hash=config_hash,
                     completed_news_ids=completed, candidates=candidates, videos=videos,
                     failures=failures, source_map=source_map,
-                )
+                ))
             except (CancellationRequested, asyncio.CancelledError):
-                return self._cancel(
+                return await self._cancel(
                     request, task_id, task_dir, raw_dir, checkpoint_path, issue,
                     input_hash, config_hash, completed, candidates, videos, failures,
                     source_map, sink, resumed,
@@ -411,7 +478,7 @@ class PipelineRunner:
                     message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=False,
                 ))
                 result = self._pipeline_result(issue, candidates, videos, failures)
-                return self._failed_result(
+                return await self._failed_result(
                     request, task_id, task_dir, raw_dir, checkpoint_path, result,
                     failures, sink, resumed, input_hash, config_hash,
                 )
@@ -421,7 +488,7 @@ class PipelineRunner:
                 ))
                 failures.append(self._failure(f"{phase}_error", (str(exc).strip() or f"执行失败（{type(exc).__name__}）")))
                 result = self._pipeline_result(issue, candidates, videos, failures)
-                return self._failed_result(
+                return await self._failed_result(
                     request, task_id, task_dir, raw_dir, checkpoint_path, result,
                     failures, sink, resumed, input_hash, config_hash,
                 )
@@ -432,21 +499,14 @@ class PipelineRunner:
         last_checkpoint = 0.0
 
         async def commit_checkpoint():
-            await self._network_runtime.loop.run_in_executor(self._network_runtime.compat, lambda: self._write_checkpoint(checkpoint_path, status="running", task_id=task_id, issue=issue,
+            await self._run_persistence(lambda: self._write_checkpoint(checkpoint_path, status="running", task_id=task_id, issue=issue,
                 input_hash=input_hash, config_hash=config_hash, completed_news_ids=completed,
                 candidates=candidates, videos=videos, failures=failures, source_map=source_map))
 
         async def save_downloads(news_id, values):
             # Persistence is serialized by this coordinator, including while
             # paused; filesystem lock waits must not stall the network loop.
-            operation = self._network_runtime.loop.run_in_executor(
-                self._network_runtime.compat, journal.save, news_id, values,
-            )
-            try:
-                await asyncio.shield(operation)
-            except asyncio.CancelledError:
-                await operation
-                raise
+            await self._run_persistence(lambda: journal.save(news_id, values))
             if journal.last_save_recovered:
                 self._emit(sink, failures, self._event("media_state_recovered", task_id, issue.issue_id,
                     news_id=news_id, message="下载清单被占用，已保存恢复快照；图片下载继续"))
@@ -487,223 +547,269 @@ class PipelineRunner:
                 news_sources: list[SourceRef] = []
                 news_candidates: list[ImageCandidate] = []
                 news_videos: list[VideoCandidate] = []
-                if news.id in media_only_news:
-                    news_sources = source_map.get(news.id, [])
-                    news_candidates = [candidate for candidate in candidates if candidate.news_id == news.id]
-                    if news.id in repair_video_news:
-                        news_videos = [video for video in videos if video.news_id == news.id
-                                       and self._video_needs_recovery(video, failures, task_dir)]
-                    for candidate in news_candidates:
-                        if journal.needs_download(candidate, failures) and candidate.download_status != "permanent_failed":
-                            candidate.download_status = "pending"
-                else:
+
+                async def process_news():
+                    nonlocal candidates, videos, failures
+                    nonlocal news_sources, news_candidates, news_videos
+                    if news.id in media_only_news:
+                        news_sources = source_map.get(news.id, [])
+                        news_candidates = [candidate for candidate in candidates if candidate.news_id == news.id]
+                        if news.id in repair_video_news:
+                            news_videos = [video for video in videos if video.news_id == news.id
+                                           and self._video_needs_recovery(video, failures, task_dir)]
+                        for candidate in news_candidates:
+                            if journal.needs_download(candidate, failures) and candidate.download_status != "permanent_failed":
+                                candidate.download_status = "pending"
+                    else:
+                        self._emit(sink, failures, self._event(
+                            "resolve_started", task_id, issue.issue_id, news_id=news.id,
+                            news_index=news_index, total_news=total_news,
+                            message="resolving sources",
+                        ))
+                        try:
+                            await token.wait_if_paused_async()
+                            self._network_runtime.resolve_failures = []
+                            self._network_runtime.resolve_progress = lambda message: self._emit(
+                                sink, failures, self._event("resolve_progress", task_id, issue.issue_id,
+                                    news_id=news.id, news_index=news_index, total_news=total_news,
+                                    message=message))
+                            resolved_sources = await asyncio.wait_for(
+                                self._resolve_async(news, request),
+                                timeout=self.config.network.news_timeout_seconds,
+                            )
+                            failures.extend(self._network_runtime.resolve_failures)
+                            news_sources = self._filter_sources(resolved_sources, request)
+                            source_map[news.id] = news_sources
+                            if request.resume and request.use_socialdata_x and self._media_cache_version == 0 and news.id in attempted_news:
+                                withheld = [source for source in news_sources if source.source_type is SourceType.OFFICIAL_X
+                                            and (match := _STATUS_ID.search(urlsplit(source.url).path))
+                                            and match.group(1) not in self._socialdata_response_cache]
+                                news_sources = [source for source in news_sources if source not in withheld]
+                                for source in withheld:
+                                    failures.append(FailureRecord(stage=FailureStage.COLLECT, news_id=news.id,
+                                        code="resume_media_missing", message="旧记录缺少 X 媒体信息，未重复查询付费帖子", source_url=source.url, retryable=False))
+                            await token.wait_if_paused_async()
+                            self._emit(sink, failures, self._event(
+                                "resolve_completed", task_id, issue.issue_id, news_id=news.id,
+                                news_index=news_index, total_news=total_news,
+                                message=f"{len(news_sources)} sources",
+                            ))
+                            await token.wait_if_paused_async()
+                        except (CancellationRequested, asyncio.CancelledError):
+                            raise
+                        except asyncio.TimeoutError as exc:
+                            raise _NewsWatchdogTimeout(
+                                f"来源解析超过 {self.config.network.news_timeout_seconds:g} 秒"
+                            ) from exc
+                        except Exception as exc:
+                            failures.append(FailureRecord(
+                                stage=FailureStage.RESOLVE, news_id=news.id, code="news_failed",
+                                message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=True,
+                            ))
+                            self._emit(sink, failures, self._event(
+                                "resolve_failed", task_id, issue.issue_id, news_id=news.id,
+                                news_index=news_index, total_news=total_news, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
+                            ))
+
+                        for source in news_sources:
+                            self._emit(sink, failures, self._event(
+                                "collect_started", task_id, issue.issue_id, news_id=news.id,
+                                news_index=news_index, total_news=total_news, message=source.url,
+                            ))
+                        collections = await self._network_runtime.collect_many(news, news_sources, request)
+                        for source, collection in zip(news_sources, collections):
+                            await token.wait_if_paused_async()
+                            try:
+                                if isinstance(collection, Exception):
+                                    raise collection
+                                news_candidates.extend(collection.candidates)
+                                news_videos.extend(collection.video_candidates)
+                                failures.extend(collection.failures)
+                                for reason in collection.manual_review_reasons:
+                                    failures.append(FailureRecord(
+                                        stage=FailureStage.COLLECT, news_id=news.id,
+                                        code="manual_review_required", message=reason.value,
+                                        source_url=source.url, retryable=False,
+                                    ))
+                                await token.wait_if_paused_async()
+                                self._emit(sink, failures, self._event(
+                                    "collect_completed", task_id, issue.issue_id,
+                                    news_id=news.id, news_index=news_index,
+                                    total_news=total_news, message=source.url,
+                                ))
+                                await token.wait_if_paused_async()
+                            except (CancellationRequested, asyncio.CancelledError):
+                                raise
+                            except Exception as exc:
+                                code = (
+                                    "source_timeout"
+                                    if isinstance(collection, TimeoutError)
+                                    else "source_failed"
+                                )
+                                failures.append(FailureRecord(
+                                    stage=FailureStage.COLLECT, news_id=news.id,
+                                    code=code, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
+                                    source_url=source.url, retryable=True,
+                                ))
+                                self._emit(sink, failures, self._event(
+                                    "collect_failed", task_id, issue.issue_id, news_id=news.id,
+                                    news_index=news_index, total_news=total_news,
+                                    message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
+                                ))
+
+                    # Register every candidate before network dispatch. Workers
+                    # mutate these records; the single result consumer commits them.
+                    if request.offline:
+                        importer = ImageDownloader(self.config)
+                        for candidate in news_candidates:
+                            if candidate.local_path or candidate.original_path:
+                                imported, failure, _ = await self._network_runtime.loop.run_in_executor(
+                                    self._network_runtime.processing, importer.import_local,
+                                    candidate, self._image_stage(task_dir),
+                                )
+                                if failure:
+                                    ImageDownloader._apply_outcome(candidate, failure)
+                                    failures.append(failure)
+                    candidates = journal.merge(candidates, news_candidates)
+                    await save_downloads(news.id, candidates)
+                    await commit_checkpoint()
+                    media_stats()
+                    await token.wait_if_paused_async()
                     self._emit(sink, failures, self._event(
-                        "resolve_started", task_id, issue.issue_id, news_id=news.id,
+                        "download_started", task_id, issue.issue_id, news_id=news.id,
                         news_index=news_index, total_news=total_news,
-                        message="resolving sources",
+                        message="media download",
                     ))
+                    await token.wait_if_paused_async()
                     try:
-                        await token.wait_if_paused_async()
-                        news_sources = self._filter_sources(
-                            await self._resolve_async(news, request), request,
-                        )
-                        source_map[news.id] = news_sources
-                        if request.resume and request.use_socialdata_x and self._media_cache_version == 0 and news.id in attempted_news:
-                            withheld = [source for source in news_sources if source.source_type is SourceType.OFFICIAL_X
-                                        and (match := _STATUS_ID.search(urlsplit(source.url).path))
-                                        and match.group(1) not in self._socialdata_response_cache]
-                            news_sources = [source for source in news_sources if source not in withheld]
-                            for source in withheld:
-                                failures.append(FailureRecord(stage=FailureStage.COLLECT, news_id=news.id,
-                                    code="resume_media_missing", message="旧记录缺少 X 媒体信息，未重复查询付费帖子", source_url=source.url, retryable=False))
+                        if request.offline:
+                            for video in news_videos:
+                                self._skip_video(video, "offline_mode", failures)
+                            await token.wait_if_paused_async()
+                        else:
+                            accepted, download_failures = await self._network_runtime.download(
+                                news_candidates, self._image_stage(task_dir), on_result=recorded,
+                            )
+                            candidates = [candidate for candidate in candidates if candidate.news_id != news.id]
+                            candidates.extend(accepted)
+                            failures.extend(value for value in download_failures if value not in failures)
+                            # Goods search depends on decoded native assets, not on
+                            # X attachment presence or unverified page dimensions.
+                            from .goods_collection import search_goods_after_download
+                            extra_sources, extra_results = await search_goods_after_download(
+                                self._network_runtime, news, news_sources, request, accepted,
+                            )
+                            extra_candidates = []
+                            for collection in extra_results:
+                                extra_candidates.extend(collection.candidates)
+                                news_videos.extend(collection.video_candidates)
+                                failures.extend(collection.failures)
+                            if extra_sources:
+                                source_map[news.id] = news_sources
+                                self._emit(sink, failures, self._event(
+                                    "collect_completed", task_id, issue.issue_id, news_id=news.id,
+                                    news_index=news_index, total_news=total_news,
+                                    message=f"商品补搜新增 {len(extra_sources)} 个来源、{len(extra_candidates)} 张候选图片",
+                                ))
+                            if extra_candidates:
+                                # Persist every newly discovered URL before
+                                # download, with the same recovery coordinator.
+                                candidates = journal.merge(candidates, extra_candidates)
+                                await save_downloads(news.id, candidates)
+                                await commit_checkpoint()
+                                downloaded, extra_failures = await self._network_runtime.download(
+                                    extra_candidates, self._image_stage(task_dir), on_result=recorded,
+                                )
+                                accepted = journal.merge(accepted, downloaded)
+                                candidates = [c for c in candidates if c.news_id != news.id]
+                                candidates.extend(accepted)
+                                failures.extend(value for value in extra_failures if value not in failures)
+                            # A single network request may finish while pause is
+                            # requested; honor it immediately after the call.
+                            await token.wait_if_paused_async()
+                            if request.no_videos or not self.config.video.enabled:
+                                for video in news_videos:
+                                    self._skip_video(video, "video_download_disabled", failures)
+                                videos.extend(news_videos)
+                            elif news_videos:
+                                await token.wait_if_paused_async()
+                                prior_successes = sum(
+                                    video.news_id == news.id and self._video_asset_is_valid(video, task_dir)
+                                    for video in videos if video.id not in {value.id for value in news_videos}
+                                )
+                                remaining_video_slots = max(0, self.config.video.max_per_news - prior_successes)
+                                downloaded, video_failures = await self._network_runtime.call_sync(
+                                    lambda: self._download_videos(news_videos, self._video_stage(task_dir),
+                                                                  max_per_news=remaining_video_slots,
+                                                                  news_item=news),
+                                )
+                                attempted_ids = {video.id for video in news_videos}
+                                videos = [video for video in videos if video.id not in attempted_ids]
+                                videos.extend(downloaded)
+                                failures = [failure for failure in failures if not (
+                                    failure.stage is FailureStage.DOWNLOAD and failure.candidate_id in attempted_ids
+                                )]
+                                failures.extend(video_failures)
+                                await token.wait_if_paused_async()
+                        videos = self._dedupe_videos([*videos, *news_videos])
                         await token.wait_if_paused_async()
                         self._emit(sink, failures, self._event(
-                            "resolve_completed", task_id, issue.issue_id, news_id=news.id,
+                            "download_completed", task_id, issue.issue_id, news_id=news.id,
                             news_index=news_index, total_news=total_news,
-                            message=f"{len(news_sources)} sources",
+                            message="media downloaded",
                         ))
                         await token.wait_if_paused_async()
                     except (CancellationRequested, asyncio.CancelledError):
                         raise
                     except Exception as exc:
                         failures.append(FailureRecord(
-                            stage=FailureStage.RESOLVE, news_id=news.id, code="news_failed",
-                            message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=True,
+                            stage=FailureStage.DOWNLOAD, news_id=news.id,
+                            code="download_failed", message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=True,
                         ))
                         self._emit(sink, failures, self._event(
-                            "resolve_failed", task_id, issue.issue_id, news_id=news.id,
+                            "download_failed", task_id, issue.issue_id, news_id=news.id,
                             news_index=news_index, total_news=total_news, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                         ))
 
-                    for source in news_sources:
-                        self._emit(sink, failures, self._event(
-                            "collect_started", task_id, issue.issue_id, news_id=news.id,
-                            news_index=news_index, total_news=total_news, message=source.url,
-                        ))
-                    collections = await self._network_runtime.collect_many(news, news_sources, request)
-                    for source, collection in zip(news_sources, collections):
-                        await token.wait_if_paused_async()
-                        try:
-                            if isinstance(collection, Exception):
-                                raise collection
-                            news_candidates.extend(collection.candidates)
-                            news_videos.extend(collection.video_candidates)
-                            failures.extend(collection.failures)
-                            for reason in collection.manual_review_reasons:
-                                failures.append(FailureRecord(
-                                    stage=FailureStage.COLLECT, news_id=news.id,
-                                    code="manual_review_required", message=reason.value,
-                                    source_url=source.url, retryable=False,
-                                ))
-                            await token.wait_if_paused_async()
-                            self._emit(sink, failures, self._event(
-                                "collect_completed", task_id, issue.issue_id,
-                                news_id=news.id, news_index=news_index,
-                                total_news=total_news, message=source.url,
-                            ))
-                            await token.wait_if_paused_async()
-                        except (CancellationRequested, asyncio.CancelledError):
-                            raise
-                        except Exception as exc:
-                            failures.append(FailureRecord(
-                                stage=FailureStage.COLLECT, news_id=news.id,
-                                code="source_failed", message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
-                                source_url=source.url, retryable=True,
-                            ))
-                            self._emit(sink, failures, self._event(
-                                "collect_failed", task_id, issue.issue_id, news_id=news.id,
-                                news_index=news_index, total_news=total_news,
-                                message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
-                            ))
-
-                # Register every candidate before network dispatch. Workers
-                # mutate these records; the single result consumer commits them.
-                if request.offline:
-                    importer = ImageDownloader(self.config)
-                    for candidate in news_candidates:
-                        if candidate.local_path or candidate.original_path:
-                            imported, failure, _ = await self._network_runtime.loop.run_in_executor(
-                                self._network_runtime.processing, importer.import_local,
-                                candidate, self._image_stage(task_dir),
-                            )
-                            if failure:
-                                ImageDownloader._apply_outcome(candidate, failure)
-                                failures.append(failure)
-                candidates = journal.merge(candidates, news_candidates)
-                await save_downloads(news.id, candidates)
-                await commit_checkpoint()
-                media_stats()
-                await token.wait_if_paused_async()
-                self._emit(sink, failures, self._event(
-                    "download_started", task_id, issue.issue_id, news_id=news.id,
-                    news_index=news_index, total_news=total_news,
-                    message="media download",
-                ))
-                await token.wait_if_paused_async()
-                try:
-                    if request.offline:
-                        for video in news_videos:
-                            self._skip_video(video, "offline_mode", failures)
-                        await token.wait_if_paused_async()
-                    else:
-                        accepted, download_failures = await self._network_runtime.download(
-                            news_candidates, self._image_stage(task_dir), on_result=recorded,
-                        )
-                        candidates = [candidate for candidate in candidates if candidate.news_id != news.id]
-                        candidates.extend(accepted)
-                        failures.extend(value for value in download_failures if value not in failures)
-                        # Goods search depends on decoded native assets, not on
-                        # X attachment presence or unverified page dimensions.
-                        from .goods_collection import search_goods_after_download
-                        extra_sources, extra_results = await search_goods_after_download(
-                            self._network_runtime, news, news_sources, request, accepted,
-                        )
-                        extra_candidates = []
-                        for collection in extra_results:
-                            extra_candidates.extend(collection.candidates)
-                            news_videos.extend(collection.video_candidates)
-                            failures.extend(collection.failures)
-                        if extra_sources:
-                            source_map[news.id] = news_sources
-                            self._emit(sink, failures, self._event(
-                                "collect_completed", task_id, issue.issue_id, news_id=news.id,
-                                news_index=news_index, total_news=total_news,
-                                message=f"商品补搜新增 {len(extra_sources)} 个来源、{len(extra_candidates)} 张候选图片",
-                            ))
-                        if extra_candidates:
-                            # Persist every newly discovered URL before
-                            # download, with the same recovery coordinator.
-                            candidates = journal.merge(candidates, extra_candidates)
-                            await save_downloads(news.id, candidates)
-                            await commit_checkpoint()
-                            downloaded, extra_failures = await self._network_runtime.download(
-                                extra_candidates, self._image_stage(task_dir), on_result=recorded,
-                            )
-                            accepted = journal.merge(accepted, downloaded)
-                            candidates = [c for c in candidates if c.news_id != news.id]
-                            candidates.extend(accepted)
-                            failures.extend(value for value in extra_failures if value not in failures)
-                        # A single network request may finish while pause is
-                        # requested; honor it immediately after the call.
-                        await token.wait_if_paused_async()
-                        if request.no_videos or not self.config.video.enabled:
-                            for video in news_videos:
-                                self._skip_video(video, "video_download_disabled", failures)
-                            videos.extend(news_videos)
-                        elif news_videos:
-                            await token.wait_if_paused_async()
-                            prior_successes = sum(
-                                video.news_id == news.id and self._video_asset_is_valid(video, task_dir)
-                                for video in videos if video.id not in {value.id for value in news_videos}
-                            )
-                            remaining_video_slots = max(0, self.config.video.max_per_news - prior_successes)
-                            downloaded, video_failures = await self._network_runtime.call_sync(
-                                lambda: self._download_videos(news_videos, self._video_stage(task_dir),
-                                                              max_per_news=remaining_video_slots),
-                            )
-                            attempted_ids = {video.id for video in news_videos}
-                            videos = [video for video in videos if video.id not in attempted_ids]
-                            videos.extend(downloaded)
-                            failures = [failure for failure in failures if not (
-                                failure.stage is FailureStage.DOWNLOAD and failure.candidate_id in attempted_ids
-                            )]
-                            failures.extend(video_failures)
-                            await token.wait_if_paused_async()
-                    videos = self._dedupe_videos([*videos, *news_videos])
-                    await token.wait_if_paused_async()
+                    completed.add(news.id)
+                    await save_downloads(news.id, candidates)
+                    media_stats()
+                    await commit_checkpoint()
                     self._emit(sink, failures, self._event(
-                        "download_completed", task_id, issue.issue_id, news_id=news.id,
+                        "news_completed", task_id, issue.issue_id, news_id=news.id,
                         news_index=news_index, total_news=total_news,
-                        message="media downloaded",
+                        message="news completed",
                     ))
                     await token.wait_if_paused_async()
+                try:
+                    watchdog_seconds = max(
+                        1.0, 3.0 * self.config.network.news_timeout_seconds,
+                    )
+                    await self._await_with_news_watchdog(
+                        process_news(), watchdog_seconds, token,
+                    )
                 except (CancellationRequested, asyncio.CancelledError):
                     raise
-                except Exception as exc:
-                    failures.append(FailureRecord(
-                        stage=FailureStage.DOWNLOAD, news_id=news.id,
-                        code="download_failed", message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=True,
-                    ))
+                except (asyncio.TimeoutError, _NewsWatchdogTimeout) as exc:
+                    detail = str(exc).strip() or f"单条新闻处理超过 {watchdog_seconds:g} 秒"
+                    message = f"{detail}，已记录并继续下一条"
+                    completed.discard(news.id)
+                    candidates = journal.merge(candidates, news_candidates)
+                    videos = self._dedupe_videos([*videos, *news_videos])
+                    failures.extend([
+                        FailureRecord(stage=FailureStage.COLLECT, news_id=news.id,
+                            code="news_timeout", message=message, retryable=True),
+                        FailureRecord(stage=FailureStage.COLLECT, news_id=news.id,
+                            code="news_failed", message=message, retryable=True),
+                    ])
+                    await save_downloads(news.id, candidates)
+                    media_stats()
+                    await commit_checkpoint()
                     self._emit(sink, failures, self._event(
-                        "download_failed", task_id, issue.issue_id, news_id=news.id,
-                        news_index=news_index, total_news=total_news, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
+                        "news_failed", task_id, issue.issue_id, news_id=news.id,
+                        news_index=news_index, total_news=total_news, message=message,
                     ))
-
-                completed.add(news.id)
-                await save_downloads(news.id, candidates)
-                media_stats()
-                self._write_checkpoint(
-                    checkpoint_path, status="running", task_id=task_id, issue=issue,
-                    input_hash=input_hash, config_hash=config_hash,
-                    completed_news_ids=completed, candidates=candidates,
-                    videos=videos, failures=failures, source_map=source_map,
-                )
-                self._emit(sink, failures, self._event(
-                    "news_completed", task_id, issue.issue_id, news_id=news.id,
-                    news_index=news_index, total_news=total_news,
-                    message="news completed",
-                ))
-                await token.wait_if_paused_async()
+                    continue
 
             await token.wait_if_paused_async()
             self._emit(sink, failures, self._event(
@@ -722,7 +828,7 @@ class PipelineRunner:
                     "curate_failed", task_id, issue.issue_id, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                 ))
                 result = self._pipeline_result(issue, candidates, videos, failures)
-                return self._failed_result(
+                return await self._failed_result(
                     request, task_id, task_dir, raw_dir, checkpoint_path, result,
                     failures, sink, resumed, input_hash, config_hash, completed, source_map,
                 )
@@ -736,7 +842,8 @@ class PipelineRunner:
             await token.wait_if_paused_async()
             try:
                 publication = asyncio.create_task(self._network_runtime.call_sync(
-                    lambda: self._publish_output(result, raw_dir, task_dir)))
+                    lambda: self._publish_output(result, raw_dir, task_dir),
+                    timeout=self._publication_timeout_seconds()))
                 try:
                     await asyncio.shield(publication)
                 except asyncio.CancelledError:
@@ -757,7 +864,7 @@ class PipelineRunner:
                 result.failures = self._merge_failures(
                     [*result.failures, *failures[failure_index:]]
                 )
-                return self._failed_result(
+                return await self._failed_result(
                     request, task_id, task_dir, raw_dir, checkpoint_path, result,
                     failures, sink, resumed, input_hash, config_hash, completed, source_map,
                 )
@@ -780,13 +887,13 @@ class PipelineRunner:
                     or not ImageDownloader.reusable(value)
                 ):
                     raise RuntimeError("已下载原件未正确发布，保留暂存文件")
-            self._write_checkpoint(
+            await self._run_persistence(lambda: self._write_checkpoint(
                 checkpoint_path, status="completed", task_id=task_id, issue=issue,
                 input_hash=input_hash, config_hash=config_hash,
                 completed_news_ids=completed, candidates=result.all_candidates,
                 videos=result.videos, failures=result.failures,
                 source_map=source_map, result=result,
-            )
+            ))
             shutil.rmtree(task_dir / ".work", ignore_errors=True)
             failure_index = len(failures)
             self._emit(sink, failures, self._event(
@@ -794,20 +901,20 @@ class PipelineRunner:
             ))
             result.failures = self._merge_failures([*result.failures, *failures[failure_index:]])
             if len(failures) > failure_index:
-                self._write_checkpoint(
+                await self._run_persistence(lambda: self._write_checkpoint(
                     checkpoint_path, status="completed", task_id=task_id, issue=issue,
                     input_hash=input_hash, config_hash=config_hash,
                     completed_news_ids=completed, candidates=result.all_candidates,
                     videos=result.videos, failures=result.failures,
                     source_map=source_map, result=result,
-                )
+                ))
             return TaskResult(
                 status="completed", task_id=task_id, task_dir=task_dir,
                 output_dir=raw_dir, checkpoint_path=checkpoint_path,
                 pipeline_result=result, resumed=resumed,
             )
         except (CancellationRequested, asyncio.CancelledError):
-            return self._cancel(
+            return await self._cancel(
                 request, task_id, task_dir, raw_dir, checkpoint_path, issue,
                 input_hash, config_hash, completed, candidates, videos, failures,
                 source_map, sink, resumed,
@@ -821,7 +928,7 @@ class PipelineRunner:
                 "output_failed", task_id, issue.issue_id, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
             ))
             result = self._pipeline_result(issue, candidates, videos, failures)
-            return self._failed_result(
+            return await self._failed_result(
                 request, task_id, task_dir, raw_dir, checkpoint_path, result,
                 failures, sink, resumed, input_hash, config_hash, completed, source_map,
             )
@@ -862,6 +969,15 @@ class PipelineRunner:
             self.resolver = self._make_resolver(config)
 
     def _collect(self, news, source, *, request=None):
+        if getattr(self, "_supplement_mode", False):
+            parsed = urlsplit(source.url)
+            host = (parsed.hostname or "").casefold()
+            if host in {"ymgal.games", "www.ymgal.games"} and parsed.path.startswith("/co/picset/"):
+                from ..supplement.providers import YmgalPicsetAdapter
+                return YmgalPicsetAdapter(self._page_client()).collect(news, source, CollectionContext(
+                    timeout_seconds=self.config.network.timeout_seconds,
+                    max_candidates=self.config.search.max_candidates_per_source,
+                    now=datetime.now(timezone.utc)))
         if self.adapter_factory is None:
             from ..discovery.goods_service import GoodsSourceService
             if GoodsSourceService.supports(news, source):
@@ -957,13 +1073,14 @@ class PipelineRunner:
         from ..discovery.http import SafeHttpClient
         return SafeHttpClient(transport=self.source_transport, timeout=20.0, max_retries=2)
 
-    def _download_videos(self, candidates, output_dir, *, max_per_news=None):
+    def _download_videos(self, candidates, output_dir, *, max_per_news=None, news_item=None):
         video_config = self.config.video
         if max_per_news is not None:
             video_config = video_config.model_copy(update={"max_per_news": max_per_news})
         if self.video_downloader_factory is None:
             from ..video import VideoDownloader
             downloader = VideoDownloader(video_config, ffmpeg_detector=self.video_ffmpeg_detector)
+            return downloader.download(candidates, output_dir, news_item=news_item)
         else:
             try:
                 downloader = self.video_downloader_factory(
@@ -1066,18 +1183,18 @@ class PipelineRunner:
     def _rewrite_paths(result, old_root, new_root):
         rebase_asset_paths(result, Path(old_root), Path(new_root))
 
-    def _cancel(
+    async def _cancel(
         self, request, task_id, task_dir, raw_dir, checkpoint_path, issue,
         input_hash, config_hash, completed, candidates, videos, failures,
         source_map, sink, resumed,
     ):
         try:
-            self._write_checkpoint(
+            await self._run_persistence(lambda: self._write_checkpoint(
                 checkpoint_path, status="cancelled", task_id=task_id, issue=issue,
                 input_hash=input_hash, config_hash=config_hash,
                 completed_news_ids=completed, candidates=candidates, videos=videos,
                 failures=failures, source_map=source_map,
-            )
+            ))
         except Exception as exc:
             failures.append(self._failure("checkpoint_error", (str(exc).strip() or f"执行失败（{type(exc).__name__}）")))
         self._emit(sink, failures, self._event(
@@ -1090,7 +1207,7 @@ class PipelineRunner:
             pipeline_result=result, resumed=resumed,
         )
 
-    def _failed_result(
+    async def _failed_result(
         self, request, task_id, task_dir, raw_dir, checkpoint_path, result,
         failures, sink, resumed, input_hash="", config_hash="",
         completed=None, source_map=None,
@@ -1113,13 +1230,13 @@ class PipelineRunner:
         )
         try:
             if input_hash and config_hash and checkpoint_path.parent.exists():
-                self._write_checkpoint(
+                await self._run_persistence(lambda: self._write_checkpoint(
                     checkpoint_path, status="failed", task_id=task_id, issue=result.issue,
                     input_hash=input_hash, config_hash=config_hash,
                     completed_news_ids=completed or set(), candidates=result.all_candidates,
                     videos=result.videos, failures=result.failures,
                     source_map=source_map or {}, result=result,
-                )
+                ))
         except Exception:
             pass
         return TaskResult(
@@ -1165,7 +1282,7 @@ class PipelineRunner:
                 same_domain_depth=0, same_domain_transport=self.source_transport,
                 search_provider=lambda _news: [],
                 search_max_results=self.config.search.max_results,
-                search_timeout=self.config.network.timeout_seconds,
+                search_timeout=self.config.network.search_timeout_seconds,
             )
         return self.resolver
 

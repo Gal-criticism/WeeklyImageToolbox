@@ -4,6 +4,7 @@ import urllib.parse
 import pytest
 
 from galgame_news.archive.models import ArchiveAsset
+from galgame_news.archive.index import ArchiveIndex
 from galgame_news.archive.providers import LocalArchiveProvider, NextcloudArchiveProvider
 
 
@@ -54,6 +55,53 @@ def test_local_provider_reads_existing_weekly_image_index_schema(tmp_path):
     assert found[0].original_source_url == "https://news.example/game"
 
 
+def test_local_provider_joins_news_game_names_from_news_id(tmp_path):
+    root = tmp_path / "task"
+    media = root / "images" / "x1" / "asset.jpg"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"image")
+    (root / "image_index.json").write_text(
+        '{"issue_id":"226","news_items":[{"news_id":"n1","title":"《Game》官网更新",'
+        '"game_names":["Game"]}],"candidates":[{"id":"c1","news_id":"n1",'
+        '"local_path":"images/x1/asset.jpg"}]}', encoding="utf-8",
+    )
+
+    found = LocalArchiveProvider([root]).scan()
+
+    assert len(found) == 1
+    assert found[0].game_names == ("Game",)
+    assert found[0].news_title == "《Game》官网更新"
+    assert found[0].metadata["news_id"] == "n1"
+    index = ArchiveIndex(tmp_path / "archive.sqlite")
+    index.replace_source("local", found)
+    assert [asset.asset_id for asset in index.search(("Game",), "227", days=None)] == [found[0].asset_id]
+    index.close()
+
+
+def test_local_provider_preserves_ambiguous_or_missing_news_identity(tmp_path):
+    root = tmp_path / "task"
+    for name in ("multi.jpg", "unknown.jpg"):
+        path = root / "images" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"image")
+    (root / "image_index.json").write_text(
+        '{"issue_id":"226","news_items":[{"news_id":"multi","title":"A × B",'
+        '"game_names":["A","B"]},{"news_id":"unknown"}],"candidates":['
+        '{"id":"m","news_id":"multi","local_path":"images/multi.jpg"},'
+        '{"id":"u","news_id":"unknown","local_path":"images/unknown.jpg"}]}', encoding="utf-8",
+    )
+
+    found = LocalArchiveProvider([root]).scan()
+
+    assert len(found) == 1
+    assert found[0].game_names == ("A", "B")
+    assert found[0].news_title == "A × B"
+    index = ArchiveIndex(tmp_path / "archive.sqlite")
+    index.replace_source("local", found)
+    assert index.search(("A",), "227", days=None) == []
+    index.close()
+
+
 def test_local_provider_refuses_to_fetch_paths_outside_configured_roots(tmp_path):
     root = tmp_path / "task"
     root.mkdir()
@@ -102,6 +150,50 @@ def test_nextcloud_propfind_depth_one_requests_metadata_only(tmp_path):
     assert "<oc:fileid/>" in kwargs["content"].decode()
     assert "<d:getetag/>" in kwargs["content"].decode()
     assert "<nc:has-preview/>" in kwargs["content"].decode()
+
+
+@pytest.mark.parametrize(("filename", "expected_kind"), [("1.png", "image"), ("1.mp4", "video")])
+def test_nextcloud_nested_media_uses_explicit_news_folder_as_game_and_keeps_source_unknown(
+    tmp_path, filename, expected_kind
+):
+    import xml.etree.ElementTree as ET
+
+    p = provider(tmp_path, FakeTransport(Response()))
+    prop = ET.fromstring("<d:prop xmlns:d='DAV:' xmlns:oc='http://owncloud.org/ns'><oc:fileid>f1</oc:fileid></d:prop>")
+    path = p._dav_root_path + "/226期/《A》新闻/图片/" + filename
+
+    asset = p._asset_from_prop(path, prop, 365, datetime(2026, 10, 27, tzinfo=timezone.utc))
+
+    assert asset is not None
+    assert asset.kind == expected_kind
+    assert asset.game_names == ("A",)
+    assert asset.news_title == "《A》新闻"
+    assert asset.original_source_url is None
+    assert asset.original_url.startswith("https://cloud.example/")
+
+
+def test_nextcloud_skips_unproved_generic_and_multi_game_folders(tmp_path):
+    import xml.etree.ElementTree as ET
+
+    p = provider(tmp_path, FakeTransport(Response()))
+    prop = ET.fromstring("<d:prop xmlns:d='DAV:' xmlns:oc='http://owncloud.org/ns'><oc:fileid>f1</oc:fileid></d:prop>")
+    base = p._dav_root_path + "/226期/"
+
+    assert p._asset_from_prop(base + "图包/1.png", prop, 365, datetime(2026, 10, 27, tzinfo=timezone.utc)) is None
+    ambiguous = p._asset_from_prop(
+        base + "《A》×《B》联合新闻/图片/1.png", prop, 365, datetime(2026, 10, 27, tzinfo=timezone.utc)
+    )
+    assert ambiguous is not None
+    assert ambiguous.game_names == ("A", "B")
+    index = ArchiveIndex(tmp_path / "archive.sqlite")
+    index.replace_source("nextcloud", [ambiguous])
+    assert index.search(("A",), "227", days=None) == []
+    index.close()
+
+    nested_plain = p._asset_from_prop(
+        base + "unlabeled-parent/random-folder/1.png", prop, 365, datetime(2026, 10, 27, tzinfo=timezone.utc)
+    )
+    assert nested_plain is None
 
 
 def test_nextcloud_scan_handles_encoded_chinese_root_and_game_path(tmp_path):

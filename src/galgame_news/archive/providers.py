@@ -74,13 +74,48 @@ def _archive_issue_number_from_segment(segment: str) -> str:
     return str(int(match.group(1))) if match else ""
 
 
-def _game_name_from_folder(folder: str) -> str:
+_GENERIC_ARCHIVE_FOLDERS = {
+    "图包", "图片", "图片包", "视频", "视频包", "周边", "新作", "汉化", "媒体", "素材",
+    "images", "image", "pictures", "picture", "videos", "video", "media", "assets",
+    "weeklyintro", "weeklyoutro", "视频成品及其工程",
+}
+_MEDIA_SUBFOLDERS = {"图包", "图片", "图片包", "视频", "视频包", "images", "image", "pictures", "picture", "videos", "video", "media"}
+
+
+def _game_names_from_folder(folder: str) -> tuple[str, ...]:
+    quoted = []
     for pattern in (r"《([^《》]+)》", r"「([^「」]+)」"):
-        match = re.search(pattern, folder)
-        if match:
-            return match.group(1).strip()
+        quoted.extend(match.strip() for match in re.findall(pattern, folder) if match.strip())
+    if quoted:
+        return tuple(dict.fromkeys(quoted))
     match = re.match(r"^\d+[_\-\s]+(.+)$", folder)
-    return match.group(1).strip() if match else folder.strip()
+    name = match.group(1).strip() if match else folder.strip()
+    return (name,) if name else ()
+
+
+def _archive_game_assignment(folder_segments: list[str]) -> tuple[tuple[str, ...], str]:
+    # Explicitly quoted game titles are reliable even when nested beneath media folders.
+    marked = [(segment, _game_names_from_folder(segment)) for segment in folder_segments]
+    explicit = [(segment, names) for segment, names in marked if re.search(r"[《「][^》」]+[》」]", segment)]
+    if explicit:
+        names = tuple(dict.fromkeys(name for _segment, values in explicit for name in values))
+        return names, " / ".join(segment for segment, _values in explicit)
+
+    if len(folder_segments) == 1:
+        segment = folder_segments[0]
+        names = _game_names_from_folder(segment)
+        if names and names[0].casefold() not in _GENERIC_ARCHIVE_FOLDERS:
+            return names, segment
+
+    # A plain named work folder is accepted only when the next level explicitly
+    # identifies itself as an image/video directory. Other arbitrary ancestors
+    # (for example issue categories or project folders) are not game evidence.
+    if len(folder_segments) >= 2 and folder_segments[-1].casefold() in _MEDIA_SUBFOLDERS:
+        segment = folder_segments[-2]
+        names = _game_names_from_folder(segment)
+        if names and names[0].casefold() not in _GENERIC_ARCHIVE_FOLDERS:
+            return names, segment
+    return (), ""
 
 
 def _local_asset(root: Path, source_id: str, item: dict, kind: str, index_file: Path) -> ArchiveAsset | None:
@@ -105,7 +140,8 @@ def _local_asset(root: Path, source_id: str, item: dict, kind: str, index_file: 
     issue = str(item.get("issue_number") or item.get("issue") or item.get("weekly_issue") or item.get("_index_issue") or "")
     issue = normalize_issue_number(issue)
     issue_date = item.get("issue_date") or item.get("date") or item.get("published_at")
-    games = item.get("game_names") or item.get("games") or item.get("game") or item.get("_news_title") or ()
+    games = (item.get("game_names") or item.get("games") or item.get("game")
+             or item.get("_news_game_names") or item.get("_news_title") or ())
     if isinstance(games, str):
         games = (games,)
     if not issue or not games:
@@ -117,7 +153,7 @@ def _local_asset(root: Path, source_id: str, item: dict, kind: str, index_file: 
         asset_id=f"{source_id}:{identity}", source_id=source_id, kind=kind,
         issue_number=normalize_issue_number(issue), path=resolved.as_posix(), name=name,
         game_names=tuple(str(value) for value in games), issue_date=str(issue_date)[:10] if issue_date else None,
-        news_title=str(item.get("news_title") or item.get("title") or ""),
+        news_title=str(item.get("news_title") or item.get("title") or item.get("_news_title") or ""),
         revision=str(item.get("revision")) if item.get("revision") is not None else None,
         size=int(item.get("size") or stat_size), source_kind="local", local_path=str(resolved),
         original_source_url=item.get("source_url") or item.get("original_source_url"),
@@ -168,20 +204,29 @@ class LocalArchiveProvider:
             records = payload
             issue_id = None
             news_titles = {}
+            news_contexts = {}
         else:
             records = payload.get("assets", payload.get("items", []))
             if not records:
                 records = payload.get("candidates" if kind == "image" else "videos", [])
             issue_id = payload.get("issue_id") or payload.get("issue_number")
-            news_titles = {
-                str(entry.get("news_id")): str(entry.get("title") or "")
-                for entry in payload.get("news_items", []) if isinstance(entry, dict)
+            news_contexts = {
+                str(entry.get("news_id")): entry
+                for entry in payload.get("news_items", [])
+                if isinstance(entry, dict) and entry.get("news_id") is not None
             }
+            news_titles = {key: str(value.get("title") or "") for key, value in news_contexts.items()}
         result = []
         for entry in records if isinstance(records, list) else ():
             if not isinstance(entry, dict):
                 continue
-            item = {**entry, "_index_issue": issue_id, "_news_title": news_titles.get(str(entry.get("news_id")), "")}
+            news = news_contexts.get(str(entry.get("news_id")), {})
+            item = {
+                **entry,
+                "_index_issue": issue_id,
+                "_news_title": news_titles.get(str(entry.get("news_id")), ""),
+                "_news_game_names": news.get("game_names") or news.get("games") or news.get("game") or (),
+            }
             asset = _local_asset(root, source_id, item, kind, index_file)
             if asset:
                 suspect = asset.date_suspect or _date_suspect(asset.issue_date, now, days)
@@ -452,9 +497,8 @@ class NextcloudArchiveProvider:
         last_modified = prop.findtext("{DAV:}getlastmodified")
         issue_date = _issue_date_from_path(path)
         folder_segments = segments[issue_index + 1:-1]
-        game_folder = folder_segments[-1] if folder_segments else ""
-        game = _game_name_from_folder(game_folder)
-        if not game or game.casefold() in {"weeklyintro", "weeklyoutro"}:
+        games, game_folder = _archive_game_assignment(folder_segments)
+        if not games or any(game.casefold() in {"weeklyintro", "weeklyoutro"} for game in games):
             return None
         fileid = prop.findtext("{http://owncloud.org/ns}fileid") or path
         identity_context = "\0".join((self.host.casefold(), self.canonical_user_id or self.username, self.root_path))
@@ -466,9 +510,9 @@ class NextcloudArchiveProvider:
         preview_available = str(preview).casefold() in {"1", "true"}
         return ArchiveAsset(
             asset_id=f"nextcloud:{server_scope_id}:{fileid}", source_id="nextcloud", kind=kind, issue_number=issue,
-            path=path, name=name, game_names=(game,), issue_date=issue_date, news_title=game_folder, revision=etag,
+            path=path, name=name, game_names=games, issue_date=issue_date, news_title=game_folder, revision=etag,
             size=int(content_length) if content_length and content_length.isdigit() else None,
-            source_kind="nextcloud", original_url=original, original_source_url=original,
+            source_kind="nextcloud", original_url=original, original_source_url=None,
             preview_url=self._preview_endpoint(fileid) if preview_available else None,
             date_suspect=_date_suspect(issue_date, now, days), metadata={"fileid": fileid, "etag": etag, "has_preview": preview, "last_modified": last_modified},
         )

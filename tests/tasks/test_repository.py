@@ -101,6 +101,29 @@ def test_rejects_external_asset_and_secret_options(tmp_path):
     assert repo.load_options() == {"offline": True}
 
 
+def test_checkpoint_scrubs_session_tokens_from_provenance_urls(tmp_path):
+    repo = TaskRepository(tmp_path)
+    repo.save_checkpoint(
+        {
+            "status": "running",
+            "issue": {"issue_id": "255", "news_items": []},
+            "source_map": {
+                "n": [
+                    {
+                        "url": (
+                            "https://store.example/item/1"
+                            "?enqueuetoken=session-secret&lang=ja"
+                        )
+                    }
+                ]
+            },
+        }
+    )
+
+    source = repo.load_checkpoint()["source_map"]["n"][0]
+    assert source["url"] == "https://store.example/item/1?lang=ja"
+
+
 def test_checkpoint_restores_news_sources_result_and_order(tmp_path):
     repo = TaskRepository(tmp_path)
     candidate_a = {"id": "z", "news_id": "n", "title": "first"}

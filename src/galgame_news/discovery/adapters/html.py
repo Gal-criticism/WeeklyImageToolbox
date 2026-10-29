@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import re
 from typing import Any, Callable
@@ -10,9 +11,11 @@ from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 
 from ...domain import CollectionContext, CollectionResult, FailureRecord, FailureStage, ImageEvidence, ReviewReason
+from ...domain import DiscoveryMethod, SourceType
 from ...video.discovery import discover_html_video_urls
 from ..gallery_scripts import gallery_script_sources, parse_gallery_script
 from ..image_evidence import evidence_for_css_image, evidence_for_image
+from ..relevance import news_relevance
 from ..http import SafeHttpClient
 from .common import (
     _candidate,
@@ -52,6 +55,64 @@ def _is_age_gate(soup: BeautifulSoup, html: str) -> bool:
     )
 
 
+def _page_identity_evidence(news_item, source_ref, soup: BeautifulSoup, page_url: str) -> tuple[bool, bool]:
+    """Return (accepted, has_identity_text) using primary page content only."""
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    if not title:
+        title = " ".join(str(meta.get("content") or "") for meta in soup.find_all("meta")
+                         if (meta.get("property") or meta.get("name") or "").casefold() in {"og:title", "twitter:title"})
+    description = " ".join(str(meta.get("content") or "") for meta in soup.find_all("meta")
+                           if (meta.get("property") or meta.get("name") or "").casefold() in {"description", "og:description", "twitter:description"})
+    content_soup = deepcopy(soup)
+    for node in list(content_soup.find_all(["nav", "footer", "aside", "script", "style", "noscript", "iframe"] )):
+        node.decompose()
+    for node in list(content_soup.find_all(True)):
+        labels = " ".join([str(node.get("id") or ""), " ".join(node.get("class") or [])]).casefold()
+        if re.search(r"recommend|related|suggest|popular|ranking|advert|sponsor|footer|breadcrumb|sidebar", labels):
+            node.decompose()
+    primary = content_soup.select_one("main, article, [role=main]") or content_soup.body or content_soup
+    body_text = " ".join(primary.stripped_strings)[:12000]
+    search_text = f"{source_ref.search_title} {source_ref.search_snippet}"
+    title_identity = news_relevance(news_item, f"{title} {description}", page_url)
+    body_identity = news_relevance(news_item, body_text, "")
+    search_identity = news_relevance(news_item, search_text, source_ref.url)
+    identity = title_identity or body_identity
+    # Search-provider hits and explicitly unverified sources must establish
+    # their own identity. A search snippet is supporting evidence only; it
+    # cannot replace a page whose primary content identifies something else.
+    searched = source_ref.discovered_via in {DiscoveryMethod.DDGS, DiscoveryMethod.BRAVE} or source_ref.source_type is SourceType.UNVERIFIED
+    if searched:
+        accepted = identity
+    else:
+        page_identity_text = f"{title} {description}".strip()
+        explicit_game_context = re.search(
+            r"visual\s*novel|galgame|game|游戏|遊戲|ノベルゲーム|ビジュアルノベル|ギャルゲー",
+            page_identity_text,
+            re.I,
+        ) is not None
+        conflicting_page_identity = explicit_game_context and not title_identity
+        trusted_chain = (
+            not conflicting_page_identity
+            and source_ref.source_type is SourceType.OFFICIAL_SITE
+            and source_ref.officiality >= 0.7
+            and bool(set(news_item.source_urls).intersection(source_ref.source_chain))
+            and search_identity
+        )
+        accepted = identity or trusted_chain
+    has_text = bool((title + description + body_text).strip())
+    return accepted, has_text
+
+
+def _should_gate_page(source_ref) -> bool:
+    return (
+        source_ref.discovered_via in {DiscoveryMethod.DDGS, DiscoveryMethod.BRAVE}
+        or source_ref.discovered_via is DiscoveryMethod.DOCUMENT
+        or source_ref.discovered_via is DiscoveryMethod.SAME_DOMAIN
+        or source_ref.source_type is SourceType.UNVERIFIED
+        or bool((source_ref.search_title or "").strip() or (source_ref.search_snippet or "").strip())
+    )
+
+
 class OfficialHtmlAdapter:
     def __init__(self, *, transport: Callable[..., Any] | None = None, client: SafeHttpClient | None = None):
         self.client = client or SafeHttpClient(transport=transport, timeout=20.0, max_retries=2)
@@ -80,6 +141,16 @@ class OfficialHtmlAdapter:
                     return CollectionResult(failures=[FailureRecord(stage=FailureStage.COLLECT,news_id=news_item.id,
                         code="page_http_error",message=f"年龄确认后的页面返回 HTTP {status}。",source_url=page_url,
                         retryable=status in {408,429} or status >= 500)])
+            if not _is_age_gate(soup, html) and _should_gate_page(source_ref):
+                accepted, has_text = _page_identity_evidence(news_item, source_ref, soup, page_url)
+                if not accepted:
+                    code = "page_relevance_rejected" if has_text else "page_relevance_unverified"
+                    source_ref.requires_review = True
+                    return CollectionResult(failures=[FailureRecord(
+                        stage=FailureStage.COLLECT, news_id=news_item.id, code=code,
+                        message="页面身份未能与本条游戏新闻核对，已在素材提取前跳过。",
+                        source_url=page_url, retryable=False,
+                    )])
             scripts = {}
             script_failures = []
             if not _is_age_gate(soup, html):
@@ -148,6 +219,16 @@ class OfficialHtmlAdapter:
                 source_ref.requires_review = True
                 source_ref.review_reasons = list(dict.fromkeys([*source_ref.review_reasons, ReviewReason.AGE_GATE]))
                 return CollectionResult(manual_review_reasons=[ReviewReason.AGE_GATE])
+            if _should_gate_page(source_ref):
+                accepted, has_text = _page_identity_evidence(news_item, source_ref, soup, page_url)
+                if not accepted:
+                    source_ref.requires_review = True
+                    return CollectionResult(failures=[FailureRecord(
+                        stage=FailureStage.COLLECT, news_id=news_item.id,
+                        code="page_relevance_rejected" if has_text else "page_relevance_unverified",
+                        message="页面身份未能与本条游戏新闻核对，已在素材提取前跳过。",
+                        source_url=page_url, retryable=False,
+                    )])
             urls: list[str] = []
             page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
             if not page_title:
@@ -161,7 +242,7 @@ class OfficialHtmlAdapter:
             image_variant_context: dict[str, str] = {}
             image_exclusions: dict[str, str] = {}
             image_evidence_context: dict[str, list[ImageEvidence]] = {}
-            video_urls = discover_html_video_urls(html, page_url)
+            video_urls = discover_html_video_urls(html, page_url, primary_content_only=True)
             script_gallery_entries = []
             all_scripts = {f"inline:{index}": tag.get_text() for index, tag in enumerate(soup.find_all("script")) if not tag.get("src")}
             all_scripts.update(_script_sources or {})

@@ -28,3 +28,49 @@ def test_archive_range_changes_enabled_checkpoint_identity_only():
 def test_unknown_archive_range_is_rejected():
     with pytest.raises(ValueError, match="往期周报范围"):
         TaskRequest("231.docx", "231", "output", archive_range="unknown")
+
+
+def test_supplement_sources_validate_and_preserve_canonical_order():
+    common = {"input_path": "231.docx", "issue_id": "231", "output_dir": "output",
+              "use_image_supplement": True}
+    request = TaskRequest(**common, supplement_sources=("vndb", "official", "store"))
+    assert request.supplement_sources == ("official", "store", "vndb")
+    with pytest.raises(ValueError, match="至少选择一项"):
+        TaskRequest(**common, supplement_sources=())
+    with pytest.raises(ValueError, match="至少选择一项"):
+        TaskRequest(**common, supplement_sources=("private",))
+
+
+def test_supplement_sources_change_checkpoint_identity_only_when_enabled():
+    config = load_config()
+    common = {"input_path": "231.docx", "issue_id": "231", "output_dir": "output"}
+    default = TaskRequest(**common)
+    subset_off = TaskRequest(**common, supplement_sources=("vndb",))
+    assert config_hash(config, default) == config_hash(config, subset_off)
+    enabled = TaskRequest(**common, use_image_supplement=True)
+    subset = TaskRequest(**common, use_image_supplement=True, supplement_sources=("official", "vndb"))
+    assert config_hash(config, enabled) != config_hash(config, subset)
+    with pytest.raises(ValueError, match="离线模式"):
+        TaskRequest(**common, offline=True, use_image_supplement=True)
+
+
+def test_supplement_sources_validate_and_preserve_canonical_order():
+    common = {"input_path": "231.docx", "issue_id": "231", "output_dir": "output",
+              "use_image_supplement": True}
+    request = TaskRequest(**common, supplement_sources=("vndb", "official", "store"))
+    assert request.supplement_sources == ("official", "store", "vndb")
+    with pytest.raises(ValueError, match="至少选择一项"):
+        TaskRequest(**common, supplement_sources=())
+    with pytest.raises(ValueError, match="至少选择一项"):
+        TaskRequest(**common, supplement_sources=("private",))
+
+
+def test_supplement_sources_change_checkpoint_identity_only_when_enabled():
+    config = load_config()
+    common = {"input_path": "231.docx", "issue_id": "231", "output_dir": "output"}
+    default = TaskRequest(**common)
+    subset_off = TaskRequest(**common, supplement_sources=("vndb",))
+    assert config_hash(config, default) == config_hash(config, subset_off)
+    enabled = TaskRequest(**common, use_image_supplement=True)
+    subset = TaskRequest(**common, use_image_supplement=True, supplement_sources=("official", "vndb"))
+    assert config_hash(config, enabled) != config_hash(config, subset)

@@ -7,15 +7,18 @@ from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 
-from ..domain import DiscoveryMethod, SourceType
+from ..domain import DiscoveryMethod, FailureRecord, FailureStage, SourceType
 from .resolver import _normalize, _visit_key
 from .adapters.html import _explicit_age_confirmation_cookie
 from .goods_context import is_goods_news, unwrap_goods_url
 
 
-async def resolve_async(resolver, news, client, call_sync):
+async def resolve_async(
+    resolver, news, client, call_sync, progress=None, on_failure=None,
+):
     ordered, seen = [], set()
     page_budget, source_budget = [16], [16]
+    report = progress or (lambda _message: None)
 
     def add(source):
         key = _normalize(source.url)
@@ -35,6 +38,7 @@ async def resolve_async(resolver, news, client, call_sync):
         visited = {_visit_key(source.url)}
 
         async def fetch(url):
+            report(f"正在检查来源页面：{url}")
             try:
                 response = await client.get(url)
                 soup = await call_sync(lambda: BeautifulSoup(response.text, "html.parser"))
@@ -42,8 +46,10 @@ async def resolve_async(resolver, news, client, call_sync):
                 if cookie:
                     response = await client.get(response.url, cookies={"PermitRate": cookie})
                     soup = await call_sync(lambda: BeautifulSoup(response.text, "html.parser"))
+                report(f"来源页面读取完成：{response.url}")
                 return response.url, soup
-            except Exception:
+            except Exception as exc:
+                report(f"来源页面暂不可用（{type(exc).__name__}）：{url}")
                 return None
 
         while frontier and page_budget[0] > 0 and source_budget[0] > 0:
@@ -75,8 +81,12 @@ async def resolve_async(resolver, news, client, call_sync):
     for url in news.source_urls:
         if urlsplit(url).scheme in {"http", "https"}:
             add(resolver._document_source(url))
-    # History stores can own SQLite connections created by the coordinator.
-    historical = list(resolver.history_lookup(news))
+    # Use a worker-owned SQLite connection so history waits cannot stall the
+    # event loop that enforces the news deadline.
+    lookup = resolver.history_lookup
+    owner = getattr(lookup, "__self__", None)
+    lookup = getattr(owner, "sources_for_in_worker", lookup)
+    historical = await call_sync(lambda: list(lookup(news)))
     for source in historical:
         add(source.model_copy(update={"discovered_via": DiscoveryMethod.HISTORY}))
     if is_goods_news(news):
@@ -96,7 +106,29 @@ async def resolve_async(resolver, news, client, call_sync):
                 "root_url": child.root_url or source.root_url or source.url,
                 "parent_url": child.parent_url or source.url,
             }))
-    for source in await call_sync(lambda: list(resolver.search_provider(news))):
+    report("正在搜索补充来源；搜索服务响应可能需要一些时间")
+    search_timeout = float(getattr(resolver, "search_timeout", 20.0))
+    try:
+        searched_sources = await asyncio.wait_for(
+            call_sync(lambda: list(resolver.search_provider(news))),
+            timeout=search_timeout,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        message = f"补充来源搜索超过 {search_timeout:g} 秒，已跳过并继续"
+        report(message)
+        if on_failure is not None:
+            on_failure(FailureRecord(
+                stage=FailureStage.RESOLVE,
+                news_id=news.id,
+                code="search_timeout",
+                message=message,
+                retryable=True,
+            ))
+        searched_sources = []
+    report(f"补充来源搜索完成：{len(searched_sources)} 个结果")
+    for source in searched_sources:
         add(source)
         if source.source_type is SourceType.OFFICIAL_SITE and source.officiality >= 0.75 and _normalize(source.url) in seen:
             source_budget[0] = min(source_budget[0], 16 - sum(s.source_type is SourceType.OFFICIAL_SITE for s in ordered))

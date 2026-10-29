@@ -184,6 +184,8 @@ class ReviewSession:
         self._ambiguous_image_ids = ambiguous_image_ids or set()
         self._decisions: dict[str, ReviewDecision] = {}
         self._manual_decisions: set[str] = set()
+        self._supplement_adopted_ids: set[str] = set()
+        self._supplement_classifications: dict[str, str] = {}
         self._image_by_id = {str(item.id): item for item in images}
         self._video_by_id = {str(item.id): item for item in videos}
         self._repository_candidate_ids = set(self._image_by_id) | set(self._video_by_id)
@@ -538,6 +540,15 @@ class ReviewSession:
             self._decisions[str(candidate.id)] = self._initial_video_decision(candidate)
         state_payload = self._read_state_payload()
         self._loaded_state_payload = dict(state_payload)
+        adopted = state_payload.get("supplement_adopted", [])
+        self._supplement_adopted_ids = set(map(str, adopted)) if isinstance(adopted, list) else set()
+        classifications = state_payload.get("supplement_classifications", {})
+        self._supplement_classifications = {str(key): str(value) for key, value in classifications.items()} if isinstance(classifications, dict) else {}
+        allowed_types = {value.value for value in ImageType}
+        for media_id, image_type in self._supplement_classifications.items():
+            candidate = self._image_by_id.get(media_id)
+            if candidate is not None and self._is_supplement(candidate) and image_type in allowed_types:
+                object.__setattr__(candidate, "image_type", ImageType(image_type))
         self.revision = int(state_payload.get("revision", 0))
         persisted = state_payload.get("decisions", {})
         if isinstance(state_payload, dict) and isinstance(state_payload.get("manual_decisions"), list):
@@ -600,6 +611,11 @@ class ReviewSession:
         values = payload.get("decisions", payload if "manual_decisions" not in payload else {})
         manual = payload.get("manual_decisions", [])
         if (not isinstance(values, dict) or not isinstance(manual, list)
+                or not isinstance(payload.get("supplement_adopted", []), list)
+                or any(not isinstance(value, (str, int)) for value in payload.get("supplement_adopted", []))
+                or not isinstance(payload.get("supplement_classifications", {}), dict)
+                or any(str(value) not in {item.value for item in ImageType}
+                       for value in payload.get("supplement_classifications", {}).values())
                 or any(not isinstance(value, (str, int)) for value in manual)
                 or not isinstance(payload.get("revision", 0), int) or payload.get("revision", 0) < 0):
             raise ValueError(f"审核状态格式错误：{self.state_path} 的 decisions/manual_decisions 字段无效")
@@ -625,6 +641,8 @@ class ReviewSession:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "decisions": {str(key): str(value) for key, value in sorted(decisions.items())},
                 "manual_decisions": sorted(manual_decisions),
+                "supplement_adopted": sorted(self._supplement_adopted_ids),
+                "supplement_classifications": dict(sorted(self._supplement_classifications.items())),
                 "revision": self.revision,
             }
         self.persist_state_payload(self.state_path, payload)
@@ -646,6 +664,11 @@ class ReviewSession:
                 raise ValueError("审核状态文件结构损坏，已保留原文件")
             values = existing.get("decisions", existing)
             if (not isinstance(values, dict) or not isinstance(existing.get("manual_decisions", []), list)
+                    or not isinstance(existing.get("supplement_adopted", []), list)
+                    or any(not isinstance(value, (str, int)) for value in existing.get("supplement_adopted", []))
+                    or not isinstance(existing.get("supplement_classifications", {}), dict)
+                    or any(str(value) not in {item.value for item in ImageType}
+                           for value in existing.get("supplement_classifications", {}).values())
                     or any(not isinstance(value, (str, int)) for value in existing.get("manual_decisions", []))
                     or not isinstance(existing.get("revision", 0), int) or existing.get("revision", 0) < 0
                     or any(str(value) not in {d.value for d in ReviewDecision} for value in values.values())):
@@ -658,6 +681,8 @@ class ReviewSession:
         decisions.update({key: value.value for key, value in self._decisions.items()})
         manual = set(map(str, payload.get("manual_decisions", []))) | self._manual_decisions
         payload.update({"schema_version": 1, "decisions": decisions, "manual_decisions": sorted(manual),
+                        "supplement_adopted": sorted(self._supplement_adopted_ids),
+                        "supplement_classifications": dict(self._supplement_classifications),
                         "revision": self.revision, "updated_at": datetime.now(timezone.utc).isoformat()})
         return payload
 
@@ -667,10 +692,11 @@ class ReviewSession:
         snap.__dict__ = self.__dict__.copy()
         for name in ("images", "videos", "news_items"):
             setattr(snap, name, list(getattr(self, name)))
-        for name in ("_source_paths", "_raw_types", "_decisions", "_image_by_id", "_video_by_id"):
+        for name in ("_source_paths", "_raw_types", "_decisions", "_image_by_id", "_video_by_id", "_supplement_classifications"):
             setattr(snap, name, dict(getattr(self, name)))
         for name in ("_review_ids", "_failed_ids", "_ambiguous_image_ids", "_manual_decisions"):
             setattr(snap, name, set(getattr(self, name)))
+        snap._supplement_adopted_ids = set(self._supplement_adopted_ids)
         snap._pending_cache = dict(self._pending_cache)
         snap._comparison_cache = self._comparison_cache
         return snap
@@ -765,8 +791,8 @@ class ReviewSession:
                                item.image_type.value if hasattr(item.image_type, "value") else str(item.image_type)) for item in candidates)
             cached = self._pending_cache.get(current_news)
             if cached is None or cached[0] != signature:
-                values = [item for item in candidates if self.decision(str(item.id)) is ReviewDecision.PENDING]
-                accepted = [item for item in candidates if self.decision(str(item.id)) is ReviewDecision.ACCEPTED]
+                values = [item for item in candidates if self.decision(str(item.id)) is ReviewDecision.PENDING and self._supplement_visible(item)]
+                accepted = [item for item in candidates if self.decision(str(item.id)) is ReviewDecision.ACCEPTED and self._supplement_visible(item)]
                 result = tuple(self._sorted_pending(reviewable_pending_images(values, accepted=accepted, comparison_cache=self._comparison_cache)))
                 self._pending_cache[current_news] = (signature, result)
             output.extend(self._pending_cache[current_news][1])
@@ -777,12 +803,54 @@ class ReviewSession:
         return values
 
     def accepted_images(self, news_id: str | None = None) -> list[ImageCandidate]:
-        values = [candidate for candidate in self.images if self.decision(str(candidate.id)) is ReviewDecision.ACCEPTED]
+        values = [candidate for candidate in self.images if self.decision(str(candidate.id)) is ReviewDecision.ACCEPTED and self._supplement_visible(candidate)]
         return [candidate for candidate in values if news_id is None or candidate.news_id == news_id]
 
     def rejected_images(self, news_id: str | None = None) -> list[ImageCandidate]:
         values = [candidate for candidate in self.images if self.decision(str(candidate.id)) is ReviewDecision.REJECTED]
         return [candidate for candidate in values if news_id is None or candidate.news_id == news_id]
+
+    @staticmethod
+    def _is_supplement(candidate: ImageCandidate) -> bool:
+        return bool((candidate.signals or {}).get("supplement_module"))
+
+    def _supplement_visible(self, candidate: ImageCandidate) -> bool:
+        return not self._is_supplement(candidate) or str(candidate.id) in self._supplement_adopted_ids
+
+    def supplement_candidates(self, news_id: str | None = None) -> list[ImageCandidate]:
+        return [candidate for candidate in self.images if self._is_supplement(candidate)
+                and str(candidate.id) not in self._supplement_adopted_ids
+                and (news_id is None or str(candidate.news_id) == str(news_id))]
+
+    def set_supplement_classification(self, media_id: str, image_type: ImageType | str, *, persist: bool = True) -> None:
+        candidate = self._image_by_id.get(str(media_id))
+        if candidate is None or not self._is_supplement(candidate):
+            raise KeyError(str(media_id))
+        selected = image_type if isinstance(image_type, ImageType) else ImageType(str(image_type))
+        if self._supplement_classifications.get(str(media_id)) == selected.value:
+            return
+        self._supplement_classifications[str(media_id)] = selected.value
+        object.__setattr__(candidate, "image_type", selected)
+        self.revision += 1
+        if persist:
+            self._persist()
+
+    def adopt_supplement_candidates(self, media_ids: Iterable[str], *, persist: bool = True) -> None:
+        ids = {str(value) for value in media_ids}
+        available = {str(candidate.id) for candidate in self.images if self._is_supplement(candidate)}
+        if not ids.issubset(available):
+            raise KeyError(next(iter(ids - available)))
+        changed = ids - self._supplement_adopted_ids
+        if not changed:
+            return
+        self._supplement_adopted_ids.update(changed)
+        for media_id in changed:
+            if media_id not in self._manual_decisions:
+                self._decisions[media_id] = ReviewDecision.PENDING
+        self.revision += 1
+        self._pending_cache.clear()
+        if persist:
+            self._persist()
 
     def pending_videos(self, news_id: str | None = None) -> list[VideoCandidate]:
         values = [candidate for candidate in self.videos if self.decision(str(candidate.id)) is ReviewDecision.PENDING]
@@ -811,10 +879,18 @@ class ReviewSession:
             raise ValueError("retry path escapes task_root/retries") from exc
         return resolved
 
-    def prepare_retry_delta(self, news_id: str, attempt_id: str, *, legacy_attempt: Any = None) -> RetryDelta:
+    def prepare_retry_delta(self, news_id: str, attempt_id: str, *, legacy_attempt: Any = None,
+                            root_override: Path | str | None = None) -> RetryDelta:
         """Read, validate and decode a retry attempt without changing this session."""
         news_id, attempt_id = str(news_id), str(attempt_id)
         root = self._confined_retry_path(news_id, attempt_id)
+        if root_override is not None:
+            proposed_root = Path(root_override).resolve()
+            task_root = Path(self.task_root).resolve() if self.task_root is not None else proposed_root.parent.parent
+            expected_parent = (task_root / "supplement").resolve()
+            if not proposed_root.is_dir() or proposed_root.parent != expected_parent:
+                raise ValueError("补图候选路径必须位于本任务 supplement/<news_id> 下")
+            root = proposed_root
         from ..tasks.repository import TaskRepository
         repository = (TaskRepository(self.task_root, create=False)
                       if self.task_root is not None and TaskRepository.is_authoritative(self.task_root) else None)
@@ -938,6 +1014,11 @@ class ReviewSession:
         if kind not in {"retry", "supplement"} or status not in {"running", "completed", "partial", "failed", "cancelled"}:
             raise ValueError("批次抓取类型或状态无效")
         return RetryDelta(news_id, attempt_id, tuple(prepared_images), tuple(prepared_videos), failures, tuple(diagnostics), kind, status)
+
+    def merge_supplement_directory(self, path: Path | str, news_id: str, *, persist: bool = True) -> RetryMergeResult:
+        directory = Path(path).resolve()
+        delta = self.prepare_retry_delta(str(news_id), "automatic", root_override=directory)
+        return self.apply_retry_delta(delta, force_pending=True, persist=persist)
 
     def apply_retry_delta(self, delta: RetryDelta, *, force_pending: bool = False, persist: bool = True) -> RetryMergeResult:
         added_images: list[str] = []
@@ -1260,6 +1341,7 @@ class ReviewSession:
         folder_names = self._folder_names()
         files: list[str] = []
         archive_assets: list[dict[str, Any]] = []
+        supplement_assets: list[dict[str, Any]] = []
 
         def record_archive(candidate, target):
             provenance = getattr(candidate, "archive_provenance", None)
@@ -1297,6 +1379,23 @@ class ReviewSession:
             target.write_bytes(data)
             files.append((Path("images") / target.relative_to(image_root)).as_posix())
             record_archive(candidate, target)
+            signals = getattr(candidate, "signals", {}) or {}
+            if signals.get("supplement_module"):
+                supplement_assets.append({
+                    "candidate_id": str(candidate.id),
+                    "news_id": str(candidate.news_id),
+                    "file": (Path("images") / target.relative_to(image_root)).as_posix(),
+                    "source_url": str(candidate.source_url or ""),
+                    "image_url": str(candidate.image_url or ""),
+                    "original_sha256": str(candidate.original_sha256 or candidate.sha256 or ""),
+                    "exported_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                    "adopted": str(candidate.id) in self._supplement_adopted_ids,
+                    "supplement_relation": str(signals.get("supplement_relation", "unknown")),
+                    "supplement_image_type": str(signals.get("supplement_image_type", "unknown")),
+                    "review_classification": str(getattr(candidate.image_type, "value", candidate.image_type)),
+                    "supplement_quality": str(signals.get("supplement_quality", "needs_review")),
+                    "review_reasons": list(candidate.review_reasons or []),
+                })
 
         reserved: dict[str, set[str]] = {}
         for candidate in self.videos:
@@ -1334,6 +1433,8 @@ class ReviewSession:
         }
         if archive_assets:
             manifest["archive_assets"] = archive_assets
+        if supplement_assets:
+            manifest["supplement_assets"] = supplement_assets
         return manifest
 
     def _issue_id(self) -> str:

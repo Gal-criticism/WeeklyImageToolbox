@@ -155,6 +155,32 @@ def test_controller_old_request_options_resume_with_all_sections(qtbot, tmp_path
     assert requests[0].selected_sections == ["x", "h", "z"]
     assert requests[0].images_only is False
     assert requests[0].archive_range == "year"
+    assert requests[0].supplement_sources == ("official", "store", "ymgal", "vndb")
+
+
+def test_controller_persists_and_resumes_supplement_source_selection(qtbot, tmp_path: Path):
+    input_path = tmp_path / "issue.docx"
+    input_path.write_bytes(b"docx")
+    output_dir = tmp_path / "output"
+    task_dir = output_dir / "task"
+    requests: list[object] = []
+    controller = DesktopController(runner_factory=lambda: _ResultRunner([task_dir], requests),
+                                   app_data=tmp_path / "app")
+    qtbot.addWidget(controller.progress_page)
+    record = controller.task_store.create_task("issue", input_path, task_root=task_dir)
+    controller.task_store.save_request_options(record, {
+        "offline": False, "use_image_supplement": True, "supplement_target_images": 7,
+        "supplement_sources": ["store", "vndb"],
+    })
+
+    assert controller.resume_task(record) is True
+    qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
+
+    assert requests[0].use_image_supplement is True
+    assert requests[0].supplement_target_images == 7
+    assert requests[0].supplement_sources == ("store", "vndb")
+    updated = controller.task_store.get_task(record.task_id)
+    assert controller.task_store.load_request_options(updated)["supplement_sources"] == ["store", "vndb"]
 
 
 def test_task_request_legacy_images_only_flag_is_read_but_ignored(tmp_path: Path):

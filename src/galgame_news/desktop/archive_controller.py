@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import hashlib
 import re
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, TimeoutError
 from pathlib import Path
 from threading import Event
+import time
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -15,10 +16,14 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from ..archive import ArchiveAsset, ArchiveIndex, LocalArchiveProvider, NextcloudArchiveProvider
 from ..archive.materialize import ArchiveMaterializer
 from ..tasks.repository import TaskRepository
+from ..concurrency import DaemonTaskPool
 
 
 class ArchiveController(QObject):
     """Keep archive I/O off the GUI thread and discard stale panel results."""
+
+    OPERATION_TIMEOUT_SECONDS = 60.0
+    INDEX_REFRESH_TIMEOUT_SECONDS = 600.0
 
     busy_changed = Signal(bool)
 
@@ -30,12 +35,14 @@ class ArchiveController(QObject):
         self.index_factory = index_factory or ArchiveIndex
         self.provider_factory = provider_factory
         self.materializer_factory = materializer_factory or ArchiveMaterializer
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="archive-operation")
+        self._executor = DaemonTaskPool(max_workers=1, thread_name_prefix="archive-operation")
         self._future: Future | None = None
         self._cancelled: Event | None = None
         self._identity: tuple | None = None
         self._completion: Callable[[Any, BaseException | None], None] | None = None
         self._pending_query: tuple[str, list[str] | None] | None = None
+        self._deadline_at: float | None = None
+        self._operation_timeout_seconds: float | None = None
         self._query_generation = 0
         self._closed = False
         self._poll = QTimer(self)
@@ -156,28 +163,45 @@ class ArchiveController(QObject):
                 providers["nextcloud"] = provider
         return providers
 
-    def _submit(self, identity, function, completion) -> bool:
+    def _submit(self, identity, function, completion, *, timeout_seconds=None) -> bool:
         if self._closed or self.busy:
             return False
+        timeout_seconds = (self.OPERATION_TIMEOUT_SECONDS if timeout_seconds is None
+                           else max(0.001, float(timeout_seconds)))
         cancelled = Event()
         self._identity = identity
         self._cancelled = cancelled
         self._completion = completion
         self._future = self._executor.submit(function, cancelled)
+        self._deadline_at = time.monotonic() + timeout_seconds
+        self._operation_timeout_seconds = timeout_seconds
         self._poll.start()
         self.busy_changed.emit(True)
         return True
 
     def _consume(self):
         future = self._future
-        if future is None or not future.done():
+        if future is None:
             return
-        try:
-            result, error = future.result(), None
-        except BaseException as exc:
-            result, error = None, exc
         identity, completion = self._identity, self._completion
+        if not future.done():
+            if self._deadline_at is None or time.monotonic() < self._deadline_at:
+                return
+            if self._cancelled is not None:
+                self._cancelled.set()
+            future.cancel()
+            timeout = self._operation_timeout_seconds or self.OPERATION_TIMEOUT_SECONDS
+            self._retire_running_future(future)
+            result, error = None, TimeoutError(
+                f"archive operation exceeded its {timeout:g} second deadline")
+        else:
+            try:
+                result, error = future.result(), None
+            except BaseException as exc:
+                result, error = None, exc
         self._future = self._cancelled = self._completion = self._identity = None
+        self._deadline_at = None
+        self._operation_timeout_seconds = None
         self._poll.stop()
         if completion is not None and not self._closed and not self._is_stale(identity):
             completion(result, error)
@@ -200,7 +224,42 @@ class ArchiveController(QObject):
         if self._cancelled is not None:
             self._cancelled.set()
         if self._future is not None:
-            self._future.cancel()
+            future = self._future
+            if not future.cancel() and not future.done():
+                self._retire_running_future(future)
+                self.busy_changed.emit(False)
+            else:
+                # A queued or just-completed operation must not deliver a late
+                # success after explicit cancellation.
+                future.add_done_callback(self._consume_detached_result)
+                self._future = self._cancelled = self._completion = self._identity = None
+                self._deadline_at = self._operation_timeout_seconds = None
+                self._poll.stop()
+                self.busy_changed.emit(False)
+
+    def _retire_running_future(self, future: Future) -> None:
+        # Python cannot stop a running filesystem/provider call. Retire its
+        # daemon worker so it cannot block later work or process exit.
+        future.add_done_callback(self._consume_detached_result)
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._future = self._cancelled = self._completion = self._identity = None
+        self._deadline_at = None
+        self._operation_timeout_seconds = None
+        self._poll.stop()
+        if not self._closed:
+            self._executor = DaemonTaskPool(max_workers=1, thread_name_prefix="archive-operation")
+
+    @staticmethod
+    def _consume_detached_result(future: Future) -> None:
+        try:
+            future.exception()
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _check_cancelled(cancelled: Event) -> None:
+        if cancelled.is_set():
+            raise CancelledError()
 
     def close(self, *, wait: bool = False) -> None:
         if self._closed:
@@ -285,7 +344,7 @@ class ArchiveController(QObject):
                 if (saved.get("issue_id") == issue and saved.get("terms") == terms
                         and saved.get("no_videos") == no_videos
                         and saved.get("archive_range", "year") == archive_range
-                        and saved.get("result_version") == 3
+                        and saved.get("result_version") == 4
                         and saved.get("index_updated") == index_stamp):
                     return [ArchiveAsset.from_dict(value) for value in saved.get("assets", [])], "已载入任务内缓存的历史结果"
                 assets = index.search(terms, current_issue=issue, no_videos=no_videos,
@@ -299,10 +358,12 @@ class ArchiveController(QObject):
                 if asset.kind not in {"image", "video"}:
                     continue
                 selected.append(asset)
+            self._check_cancelled(cancelled)
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            self._check_cancelled(cancelled)
             snapshot_path.write_text(json.dumps({"issue_id": issue, "terms": terms,
                 "no_videos": no_videos, "archive_range": archive_range,
-                "result_version": 3,
+                "result_version": 4,
                 "index_updated": index_stamp,
                 "assets": [asset.to_dict() for asset in selected]},
                 ensure_ascii=False, indent=2), encoding="utf-8")
@@ -327,20 +388,27 @@ class ArchiveController(QObject):
             local = LocalArchiveProvider(local_roots)
             try:
                 records = local.scan(days=settings.range_days, cancelled=cancelled)
+                self._check_cancelled(cancelled)
                 index = self.index_factory(self._index_path())
                 try:
+                    self._check_cancelled(cancelled)
                     index.replace_source("local", records)
                 finally:
                     index.close()
                 reports.append(f"本地索引更新 {len(records)} 项")
+            except CancelledError:
+                raise
             except BaseException as exc:
                 reports.append(f"本地索引失败：{exc}")
             try:
+                self._check_cancelled(cancelled)
                 provider = self._nextcloud(settings)
                 if provider is not None:
                     records = provider.scan(days=settings.range_days, cancelled=cancelled)
+                    self._check_cancelled(cancelled)
                     index = self.index_factory(self._index_path())
                     try:
+                        self._check_cancelled(cancelled)
                         index.replace_source("nextcloud", records)
                     finally:
                         index.close()
@@ -348,6 +416,9 @@ class ArchiveController(QObject):
                     self._close_provider(provider)
                 else:
                     reports.append("Nextcloud 未配置，已保留可用的本地索引")
+            except CancelledError:
+                self._close_provider(locals().get("provider"))
+                raise
             except BaseException as exc:
                 self._close_provider(locals().get("provider"))
                 reports.append(f"Nextcloud 索引失败，保留上次索引：{exc}")
@@ -355,7 +426,8 @@ class ArchiveController(QObject):
 
         def done(value, error):
             self.desktop.settings_page.set_archive_status(f"索引更新失败：{error}" if error else value)
-        return self._submit(None, work, done)
+        return self._submit(None, work, done,
+                            timeout_seconds=self.INDEX_REFRESH_TIMEOUT_SECONDS)
 
     def test_connection(self, settings=None) -> bool:
         settings = settings or self._settings()
@@ -483,12 +555,15 @@ class ArchiveController(QObject):
             images = image_payload.get("candidates", [])
             videos = video_payload.get("videos", [])
             if TaskRepository.is_authoritative(storage_root):
+                self._check_cancelled(cancelled)
                 TaskRepository(storage_root, create=False).save_batch(
                     news_id, attempt_id, str(attempt_path), "retry", "completed", images, videos, [],
                     source_url=candidate.source_url)
             from ..tasks.store import TaskStore
+            self._check_cancelled(cancelled)
             store = TaskStore(app_data, recover_on_startup=False)
             try:
+                self._check_cancelled(cancelled)
                 store.register_retry_attempt(record, news_id, attempt_id, kind="retry", path=attempt_path)
             finally:
                 store.close()

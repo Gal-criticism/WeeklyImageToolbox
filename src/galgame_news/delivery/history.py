@@ -142,7 +142,21 @@ class SQLiteHistoryStore:
         return HistoricalImage(**dict(row)) if row else None
 
     def sources_for(self, news_item: NewsItem) -> list[SourceRef]:
-        rows = self.connection.execute(
+        return self._sources_for(self.connection, news_item)
+
+    def sources_for_in_worker(self, news_item: NewsItem) -> list[SourceRef]:
+        # Use a worker-owned read-only connection; never share the UI's SQLite
+        # connection across threads or create a missing history database.
+        connection = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.1)
+        try:
+            connection.row_factory = sqlite3.Row
+            return self._sources_for(connection, news_item)
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _sources_for(connection, news_item: NewsItem) -> list[SourceRef]:
+        rows = connection.execute(
             """SELECT s.source_id, s.url, s.source_type, s.domain, s.discovered_via,
                       s.officiality, s.requires_review, s.review_reasons_json, n.payload_json
                FROM sources AS s JOIN news_items AS n ON n.news_id = s.news_id

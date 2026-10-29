@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
@@ -31,6 +31,9 @@ _OPTIONS = {
     "use_socialdata_x",
     "use_archive_materials",
     "archive_range",
+    "use_image_supplement",
+    "supplement_target_images",
+    "supplement_sources",
     "include_x",
     "include_h",
     "include_z",
@@ -40,8 +43,40 @@ _MAX_TASK_IMAGE_PIXELS = 50_000_000
 
 
 def _json(value: Any) -> str:
+    value = _scrub_url_credentials(value)
     _check_secrets(value)
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _scrub_url_credentials(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _scrub_url_credentials(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_url_credentials(v) for v in value]
+    if isinstance(value, tuple):
+        return [_scrub_url_credentials(v) for v in value]
+    if not isinstance(value, str) or "://" not in value:
+        return value
+    try:
+        parts = urlsplit(value)
+        if parts.scheme not in {"http", "https"} or not parts.query:
+            return value
+        query = [
+            (name, item)
+            for name, item in parse_qsl(parts.query, keep_blank_values=True)
+            if not (
+                re.search(
+                    r"(?i)(token|key|signature|credential|secret|auth|password)",
+                    name,
+                )
+                and item
+            )
+        ]
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
+    except ValueError:
+        return value
 
 
 def _check_secrets(value: Any, key: str = "") -> None:

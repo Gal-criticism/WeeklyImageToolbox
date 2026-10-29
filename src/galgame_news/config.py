@@ -40,6 +40,8 @@ class FilterConfig(_ConfigModel):
 
 class NetworkConfig(_ConfigModel):
     timeout_seconds: float = Field(gt=0)
+    search_timeout_seconds: float = Field(default=20.0, gt=0, le=300)
+    news_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
     max_retries: int = Field(ge=0, le=10)
     user_agent: str = Field(min_length=1)
     trust_env: bool = True
@@ -52,6 +54,7 @@ class NetworkConfig(_ConfigModel):
 
 
 CONCURRENCY_FIELDS = frozenset({
+    "search_timeout_seconds", "news_timeout_seconds",
     "page_concurrency", "page_per_host", "image_concurrency", "image_per_host",
     "image_processing_threads", "socialdata_concurrency", "trust_env",
 })

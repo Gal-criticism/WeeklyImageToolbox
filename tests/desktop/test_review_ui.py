@@ -68,7 +68,7 @@ def test_chinese_grid_and_news_filter_keep_tab_mapping(qtbot, tmp_path):
     page.set_session(session)
     wait_ready(qtbot, page)
     assert page.splitter.count() == 3
-    assert [page.tabs.tabText(index) for index in range(5)] == ["已选", "未候选／待复核", "往期周报", "已排除", "视频"]
+    assert [page.tabs.tabText(index) for index in range(6)] == ["已选", "未候选／待复核", "往期周报", "补图候选", "已排除", "视频"]
     assert page.media_list.viewMode() is page.media_list.ViewMode.IconMode
     assert page.media_list.selectionMode() is QAbstractItemView.SelectionMode.ExtendedSelection
     assert page.media_list.count() == 3
@@ -97,7 +97,7 @@ def test_news_tree_section_filter_and_sequence_preservation(qtbot, tmp_path):
     wait_ready(qtbot, page)
     assert {item.news_id for item in page._items} == {"news-2"}
     assert {str(item.id) for item in page._items} == {str(item.id) for item in page.session.pending_images() if item.news_id == "news-2"}
-    page.tabs.setCurrentIndex(3)
+    page.tabs.setCurrentIndex(4)
     wait_ready(qtbot, page)
     assert page.media_list.count() == 0
 

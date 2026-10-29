@@ -30,7 +30,7 @@ class Application:
             same_domain_depth=0 if offline else self.config.search.same_domain_depth,
             same_domain_transport=source_transport,
             search_max_results=self.config.search.max_results,
-            search_timeout=self.config.network.timeout_seconds,
+            search_timeout=self.config.network.search_timeout_seconds,
         )
         self.max_images = max_images
         self.source_transport = source_transport

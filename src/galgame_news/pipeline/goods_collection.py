@@ -92,7 +92,10 @@ async def search_goods_after_download(runtime, news, sources, request, candidate
             news_id=news.id, code="goods_search_budget_exhausted",
             message="尚未取得合格高清商品图，但商品采集已达 16 页上限，未继续补搜。", retryable=False)])]
     try:
-        fallback = await runtime.call_sync(lambda: list(resolver.search_provider(news)))
+        fallback = await asyncio.wait_for(
+            runtime.call_sync(lambda: list(resolver.search_provider(news))),
+            timeout=runtime.runner.config.network.search_timeout_seconds,
+        )
         extra = []
         for source in fallback:
             if goods_site(source.url) and _normalize(unwrap_goods_url(source.url)) not in state.seen:
@@ -110,6 +113,11 @@ async def search_goods_after_download(runtime, news, sources, request, candidate
         return extra, results
     except (CancellationRequested, asyncio.CancelledError):
         raise
+    except asyncio.TimeoutError:
+        return [], [CollectionResult(failures=[FailureRecord(stage=FailureStage.RESOLVE,
+            news_id=news.id, code="search_timeout",
+            message=(f"商品补充搜索超过 {runtime.runner.config.network.search_timeout_seconds:g} 秒；"
+                     "已取得的图片仍保留。"), retryable=True)])]
     except Exception as exc:
         return [], [CollectionResult(failures=[FailureRecord(stage=FailureStage.RESOLVE,
             news_id=news.id, code="goods_search_failed",

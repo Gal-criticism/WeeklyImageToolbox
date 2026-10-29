@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import inspect
 import json
@@ -15,6 +14,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
+from ..concurrency import DaemonTaskPool
 from .http import ResponseTooLarge, UnsafeUrlError, _public_url, _verified_www_fallback
 
 
@@ -54,6 +54,8 @@ class _NoCookieJar(httpx.Cookies):
 
 
 class AsyncHttpClient:
+    _CANCELLATION_CLEANUP_SECONDS = 0.05
+
     def __init__(
         self,
         *,
@@ -80,7 +82,7 @@ class AsyncHttpClient:
         self._host_limit = max(1, per_host_concurrency)
         self._hosts: dict[str, asyncio.Semaphore] = {}
         self._client: httpx.AsyncClient | None = None
-        self._executor = ThreadPoolExecutor(max_workers=max(1, concurrency), thread_name_prefix="galgame-http")
+        self._executor = DaemonTaskPool(max_workers=max(1, concurrency), thread_name_prefix="galgame-http")
         self._cache: dict[tuple[Any, ...], AsyncHttpResponse] = {}
         self._flights: dict[tuple[Any, ...], asyncio.Task[AsyncHttpResponse]] = {}
         self._network_requests = 0
@@ -103,7 +105,10 @@ class AsyncHttpClient:
         if parts.username is not None or parts.password is not None:
             raise UnsafeUrlError(f"URL credentials forbidden: {url}")
         loop = asyncio.get_running_loop()
-        await self._wait(loop.run_in_executor(self._executor, _public_url, url, self.resolver))
+        await self._wait(
+            loop.run_in_executor(self._executor, _public_url, url, self.resolver),
+            timeout=self.timeout,
+        )
 
     async def __aenter__(self) -> AsyncHttpClient:
         return self
@@ -142,8 +147,26 @@ class AsyncHttpClient:
                     return await task
         except BaseException:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            done, _ = await asyncio.wait(
+                {task}, timeout=self._CANCELLATION_CLEANUP_SECONDS,
+            )
+            if done:
+                await asyncio.gather(task, return_exceptions=True)
+            else:
+                # Cancellation-resistant transports may finish later. Retrieve
+                # any eventual exception without keeping this request/close path
+                # blocked while they perform cleanup.
+                task.add_done_callback(self._consume_task_result)
             raise
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Future[Any]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            pass
 
     async def _gate(self) -> None:
         while True:
@@ -328,7 +351,7 @@ class AsyncHttpClient:
             iterator = raw.aiter_bytes()
             while True:
                 try:
-                    chunk = await self._wait(anext(iterator))
+                    chunk = await self._wait(anext(iterator), timeout=self.timeout)
                 except StopAsyncIteration:
                     break
                 size += len(chunk)

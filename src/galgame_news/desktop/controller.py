@@ -25,7 +25,7 @@ from .progress_page import ProgressPage
 from .review_page import ReviewPage
 from .settings_page import SettingsPage
 from .theme import apply_theme
-from .worker import PipelineWorker, ReviewGrabWorker
+from .worker import PipelineWorker, ReviewGrabWorker, SupplementMissingWorker
 from ..diagnostics import diagnose_error, format_error
 from .review_jobs import ReviewQuery
 from .archive_controller import ArchiveController
@@ -130,6 +130,8 @@ class DesktopController(QObject):
         self.retry_failed.connect(self.review_page.show_retry_failure)
         self.review_page.supplement_requested.connect(self.supplement_news)
         self.review_page.supplement_cancel_requested.connect(self.cancel_supplement)
+        self.review_page.supplement_adopt_requested.connect(self.adopt_supplement_candidates)
+        self.review_page.supplement_run_requested.connect(self.run_supplement_action)
         self.settings_page.theme_changed.connect(self.apply_theme)
         self.archive_controller = ArchiveController(self)
         self.archive_controller.busy_changed.connect(self._update_migration_action)
@@ -151,6 +153,7 @@ class DesktopController(QObject):
         self._supplement_token = None
         self._supplement_context = None
         self._supplement_active = False
+        self._automatic_supplement = False
         self._grab_result_done = self._grab_thread_done = False
         self._closing = False
         self._force_closing = False
@@ -370,6 +373,9 @@ class DesktopController(QObject):
         images_only: bool = False,
         use_archive_materials: bool = False,
         archive_range: str = "year",
+        use_image_supplement: bool = False,
+        supplement_target_images: int = 5,
+        supplement_sources: list[str] | tuple[str, ...] = ("official", "store", "ymgal", "vndb"),
         resume: bool = False,
         task_dir: Path | str | None = None,
         task_id: str | None = None,
@@ -396,6 +402,9 @@ class DesktopController(QObject):
                 images_only=images_only,
                 use_archive_materials=use_archive_materials,
                 archive_range=archive_range,
+                use_image_supplement=bool(use_image_supplement and not offline),
+                supplement_target_images=supplement_target_images,
+                supplement_sources=tuple(supplement_sources),
                 selected_sections=(
                     ["x", "h", "z"] if selected_sections is None else selected_sections
                 ),
@@ -471,6 +480,9 @@ class DesktopController(QObject):
             llm_model=options.get("llm_model"),
             use_archive_materials=bool(options.get("use_archive_materials", False)),
             archive_range=options.get("archive_range", "year"),
+            use_image_supplement=bool(options.get("use_image_supplement", False)),
+            supplement_target_images=int(options.get("supplement_target_images", 5)),
+            supplement_sources=tuple(options.get("supplement_sources", ("official", "store", "ymgal", "vndb"))),
             resume=True,
             task_dir=Path(record.task_root),
             task_id=record.task_id,
@@ -680,12 +692,15 @@ class DesktopController(QObject):
                     session.merge_retry_attempt(attempt, force_pending=attempt.kind == "supplement")
                 except (OSError, ValueError, TypeError) as exc:
                     self.progress_page.log.appendPlainText(format_error(exc, stage="恢复补抓批次"))
+            self._merge_supplement_fallbacks(session, self.task_store.storage_root(record), persist=True)
         except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
             self.review_page.set_session(None)
             self.review_record = None
             QMessageBox.warning(self.review_page, "无法打开图片审核", str(exc))
             return None
         self.review_page.set_session(session)
+        options = self.task_store.load_request_options(record)
+        self.review_page.set_supplement_controls(bool(options.get("use_image_supplement", False)))
         warnings = getattr(self.task_store, "retry_diagnostics", [])
         if warnings:
             self.review_page.show_diagnostics(warnings)
@@ -732,6 +747,7 @@ class DesktopController(QObject):
                         session.merge_retry_attempt(attempt, force_pending=attempt.kind == "supplement", persist=False)
                     except (ValueError, OSError, TypeError) as exc:
                         store.retry_diagnostics.append(diagnose_error(exc, stage="恢复批次", source=str(attempt.path)))
+                self._merge_supplement_fallbacks(session, store.storage_root(record), persist=False)
                 return record, session, list(store.retry_diagnostics)
             finally:
                 store.close()
@@ -763,6 +779,7 @@ class DesktopController(QObject):
                 session.set_decisions(ids, decision, persist=False)
         self.review_record = record
         self.review_page.set_session(session)
+        self.review_page.set_supplement_controls(bool(self.task_store.load_request_options(record).get("use_image_supplement", False)))
         self.review_page.state_writer.enqueue(session)
         if warnings:
             self.review_page.show_diagnostics(warnings)
@@ -789,6 +806,18 @@ class DesktopController(QObject):
             self.review_record = updated
         self.history_page.refresh()
 
+    @staticmethod
+    def _merge_supplement_fallbacks(session: ReviewSession, task_root: Path, *, persist: bool) -> None:
+        supplement_root = Path(task_root) / "supplement"
+        if not supplement_root.is_dir():
+            return
+        for index_path in supplement_root.glob("*/image_index.json"):
+            try:
+                session.merge_supplement_directory(index_path.parent, index_path.parent.name, persist=persist)
+            except (OSError, ValueError, TypeError) as exc:
+                # Keep the task usable; the malformed index remains on disk for diagnosis.
+                continue
+
     def _save_request_options(
         self, record: TaskRecord | None, request: TaskRequest
     ) -> None:
@@ -809,6 +838,9 @@ class DesktopController(QObject):
                 "llm_model": request.llm_model,
                 "use_archive_materials": bool(request.use_archive_materials),
                 "archive_range": request.archive_range,
+                "use_image_supplement": bool(request.use_image_supplement),
+                "supplement_target_images": request.supplement_target_images,
+                "supplement_sources": list(request.supplement_sources),
             },
         )
 
@@ -826,6 +858,133 @@ class DesktopController(QObject):
     @Slot(str, str)
     def supplement_news(self, news_id: str, source_url: str) -> bool:
         return self._start_review_grab("supplement", news_id, source_url)
+
+    def adopt_supplement_candidates(self, media_ids) -> None:
+        session = self.review_page.session
+        if session is None:
+            return
+        try:
+            session.adopt_supplement_candidates(media_ids, persist=False)
+            self.review_page.state_writer.enqueue(session)
+            self.review_page.refresh(preserve_position=True)
+            self.review_page.operation_status.setText(f"已采用 {len(media_ids)} 张补图候选；现在可在待复核列表中逐张审核")
+        except (KeyError, ValueError) as exc:
+            self.review_page.show_diagnostics([diagnose_error(exc, stage="采用补图候选")])
+
+    def run_supplement_action(self, action: str) -> bool:
+        if action not in {"current", "all", "continue", "retry_failed"}:
+            return False
+        record = self.review_record or self.current_record
+        session = self.review_page.session
+        if record is None or session is None or self._automatic_supplement:
+            return False
+        news_id = self.review_page._news_filter()
+        if action == "current" and not news_id:
+            self.review_page.operation_status.setText("请先在左侧选择一条具体新闻")
+            return False
+        try:
+            from ..pipeline.checkpoint import load_checkpoint
+            issue = getattr(self.last_result, "issue", None)
+            if issue is None:
+                root = self.task_store.storage_root(record)
+                candidates = [getattr(self.last_result, "checkpoint_path", None),
+                              root / "checkpoint.sqlite3", root / "checkpoint.json",
+                              Path(record.root_path) / "checkpoint.sqlite3",
+                              Path(record.root_path) / "checkpoint.json"]
+                checkpoint_path = next((Path(path) for path in candidates if path and Path(path).is_file()), None)
+                if checkpoint_path is None:
+                    raise FileNotFoundError("任务检查点缺失，无法读取真实新闻列表以补图")
+                issue = load_checkpoint(checkpoint_path).issue
+            options = self.task_store.load_request_options(record)
+            storage_root = self.task_store.storage_root(record)
+            request = TaskRequest(input_path=record.input_path or storage_root / "input.docx",
+                issue_id=record.issue_id, output_dir=storage_root, task_id=record.task_id,
+                offline=bool(options.get("offline", False)), no_videos=True,
+                use_socialdata_x=bool(options.get("use_socialdata_x", False)),
+                selected_sections=options.get("selected_sections", ["x", "h", "z"]),
+                config_path=options.get("config_path"), history_db=options.get("history_db"),
+                max_images=options.get("max_images"), use_image_supplement=True,
+                supplement_target_images=int(options.get("supplement_target_images", 5)),
+                supplement_sources=tuple(options.get("supplement_sources", ("official", "store", "ymgal", "vndb"))))
+            if request.offline:
+                raise ValueError("离线任务不能启动联网补图")
+            runner = self.runner_factory()
+            self._configure_runner_browser(runner)
+            runner._supplement_credential_store = self.credential_store
+            token = CancellationToken()
+            identity = (record.task_id, id(session), uuid.uuid4().hex)
+            kwargs = dict(task_root=storage_root, issue=issue, request=request,
+                          news_ids=[news_id] if action == "current" else None,
+                          retry_failed=action == "retry_failed")
+            self._automatic_supplement = True
+            self._supplement_active = True
+            self._supplement_token = token
+            self._supplement_context = (identity, record, session, "automatic")
+            self._grab_result_done = self._grab_thread_done = False
+            self._supplement_worker = SupplementMissingWorker(runner, kwargs, token, identity)
+            self._supplement_thread = QThread(self)
+            self._supplement_worker.moveToThread(self._supplement_thread)
+            self._supplement_thread.started.connect(self._supplement_worker.run)
+            self._supplement_worker.event.connect(self._on_supplement_event)
+            self._supplement_worker.finished.connect(self._on_automatic_supplement_finished)
+            self._supplement_worker.failed.connect(self._on_automatic_supplement_failed)
+            self._supplement_worker.finished.connect(self._supplement_thread.quit, Qt.ConnectionType.DirectConnection)
+            self._supplement_worker.failed.connect(self._supplement_thread.quit, Qt.ConnectionType.DirectConnection)
+            self._supplement_thread.finished.connect(self._supplement_worker.deleteLater)
+            self._supplement_thread.finished.connect(self._on_automatic_supplement_thread_finished)
+            self.review_page.set_supplement_busy(True)
+            self.review_page.operation_status.setText("正在从多个来源补充图片…")
+            self._supplement_thread.start()
+            self.work_changed.emit()
+            return True
+        except Exception as exc:
+            self._automatic_supplement = False
+            self._supplement_active = False
+            self.review_page.show_supplement_failure(exc)
+            return False
+
+    def _on_automatic_supplement_finished(self, value):
+        identity, results = value
+        if self._supplement_context is None or self._supplement_context[0] != identity:
+            return
+        added = sum(int(getattr(result, "success_count", 0)) for result in results or [])
+        failed = sum(int(getattr(result, "failed_count", 0)) for result in results or [])
+        self.review_page.operation_status.setText(f"补图运行完成：成功 {added} 项，失败 {failed} 项。正在重新读取候选…")
+        self._grab_result_done = True
+        self._finish_automatic_supplement_if_ready()
+
+    def _on_automatic_supplement_failed(self, value):
+        identity, error = value
+        if self._supplement_context is None or self._supplement_context[0] != identity:
+            return
+        self.review_page.show_supplement_failure(error)
+        self._grab_result_done = True
+        self._finish_automatic_supplement_if_ready()
+
+    def _on_automatic_supplement_thread_finished(self):
+        if self.sender() is not self._supplement_thread:
+            return
+        self._grab_thread_done = True
+        self._finish_automatic_supplement_if_ready()
+
+    def _finish_automatic_supplement_if_ready(self):
+        if not (self._grab_result_done and self._grab_thread_done):
+            return
+        thread = self._supplement_thread
+        if thread is not None and not thread.wait(0):
+            QTimer.singleShot(10, self._finish_automatic_supplement_if_ready)
+            return
+        context = self._supplement_context
+        record = context[1] if context else None
+        self._supplement_thread = self._supplement_worker = self._supplement_token = None
+        self._supplement_context = None
+        self._supplement_active = self._automatic_supplement = False
+        if thread is not None:
+            thread.deleteLater()
+        self.review_page.set_supplement_busy(False)
+        if record is not None and not self._closing:
+            self._load_review_from_page(record)
+        self.work_changed.emit()
 
     def _start_review_grab(self, kind: str, news_id: str, source_url: str) -> bool:
         if (self._closing or self._migration_active or self.is_running or self.is_supplement_running or self._review_loader.busy or self.archive_controller.busy

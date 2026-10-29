@@ -23,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from ..config import VideoConfig
 from ..domain import FailureRecord, FailureStage, VideoCandidate, VideoStatus
+from ..discovery.relevance import matches_work, news_relevance
 from ..settings.ffmpeg import discover_ffmpeg
 
 
@@ -364,6 +365,8 @@ class VideoDownloader:
         self,
         candidates: Iterable[VideoCandidate],
         output_dir: str | Path,
+        *,
+        news_item=None,
     ) -> tuple[list[VideoCandidate], list[FailureRecord]]:
         """Download candidates and return all final states plus isolated failures."""
         result: list[VideoCandidate] = []
@@ -397,7 +400,7 @@ class VideoDownloader:
                 with tempfile.TemporaryDirectory(prefix="item-", dir=staging_path) as item_stage:
                     self._process_one(
                         candidate, Path(item_stage), output_path,
-                        reserved_names, accepted_by_news, failures,
+                        reserved_names, accepted_by_news, failures, news_item,
                     )
                 result.append(candidate)
         finally:
@@ -444,6 +447,7 @@ class VideoDownloader:
         reserved_names: set[str],
         accepted_by_news: dict[str, int],
         failures: list[FailureRecord],
+        news_item=None,
     ) -> None:
         candidate.status = VideoStatus.DOWNLOADING
         try:
@@ -463,6 +467,18 @@ class VideoDownloader:
                     self._skip(candidate, "playlist_not_allowed", failures)
                     return
                 self._apply_metadata(candidate, info)
+
+                if news_item is not None:
+                    video_title = str(info.get("title") or "")
+                    description = str(info.get("description") or "")
+                    description = re.split(r"\b(?:recommended|related videos?|also watch|suggested videos?)\b|推荐|推薦|猜你喜欢|相關影片|関連動画", description, maxsplit=1, flags=re.I)[0]
+                    # Uploader/channel identity is deliberately not used as
+                    # the deciding signal: makers also publish other works.
+                    if not matches_work(news_item, video_title) or not news_relevance(news_item, f"{video_title} {description}"):
+                        generic_title = re.fullmatch(r"\s*(?:pv|trailer|official video|video|予告|預告|pv公開|動画公開)\s*", video_title, re.I)
+                        code = "video_relevance_unverified" if generic_title or not video_title else "video_relevance_rejected"
+                        self._skip(candidate, code, failures)
+                        return
 
                 duration = candidate.duration_seconds
                 if duration is not None and duration > self.config.max_duration_seconds:

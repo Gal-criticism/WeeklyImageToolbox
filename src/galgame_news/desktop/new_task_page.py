@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -87,6 +88,40 @@ class NewTaskPage(QWidget):
         archive_range_container.hide()
         self.archive_range_container = archive_range_container
         self.archive_materials_checkbox.toggled.connect(archive_range_container.setVisible)
+        self.image_supplement_checkbox = QCheckBox("自动补图（从多个来源寻找缺图）")
+        self.image_supplement_checkbox.setObjectName("useImageSupplementCheckbox")
+        self.image_supplement_checkbox.setToolTip("默认关闭；联网补充的图片会单独列为候选，需人工审核。")
+        self.supplement_target_spin = QSpinBox()
+        self.supplement_target_spin.setObjectName("supplementTargetImagesSpin")
+        self.supplement_target_spin.setRange(1, 50)
+        self.supplement_target_spin.setValue(5)
+        supplement_options = QWidget()
+        supplement_layout = QVBoxLayout(supplement_options)
+        supplement_layout.setContentsMargins(20, 0, 0, 0)
+        supplement_target_row = QHBoxLayout()
+        supplement_target_row.addWidget(QLabel("每条新闻目标图片数"))
+        supplement_target_row.addWidget(self.supplement_target_spin)
+        supplement_target_row.addStretch()
+        supplement_layout.addLayout(supplement_target_row)
+        self.supplement_source_checkboxes = {
+            "official": QCheckBox("官网"),
+            "store": QCheckBox("商店"),
+            "ymgal": QCheckBox("Ymgal"),
+            "vndb": QCheckBox("VNDB"),
+        }
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("来源"))
+        for checkbox in self.supplement_source_checkboxes.values():
+            checkbox.setChecked(True)
+            source_row.addWidget(checkbox)
+        source_row.addStretch()
+        supplement_layout.addLayout(source_row)
+        supplement_options.hide()
+        self.supplement_options = supplement_options
+        self.image_supplement_checkbox.toggled.connect(supplement_options.setVisible)
+        self.image_supplement_checkbox.toggled.connect(self.supplement_target_spin.setEnabled)
+        self.supplement_target_spin.setEnabled(False)
+        self.offline_checkbox.toggled.connect(self._offline_changed)
         self.section_checkboxes = {
             "x": QCheckBox("新作"),
             "h": QCheckBox("汉化"),
@@ -137,6 +172,8 @@ class NewTaskPage(QWidget):
         options_layout.addWidget(self.socialdata_checkbox)
         options_layout.addWidget(self.archive_materials_checkbox)
         options_layout.addWidget(archive_range_container)
+        options_layout.addWidget(self.image_supplement_checkbox)
+        options_layout.addWidget(supplement_options)
         notice = QLabel("任务完成后保留完整输出：raw、索引、检查点、缓存、审核状态与 final 图片交付，便于审核和恢复。")
         notice.setObjectName("muted")
         notice.setWordWrap(True)
@@ -184,6 +221,12 @@ class NewTaskPage(QWidget):
         self._update_start_enabled()
         self.import_button.setEnabled(not busy)
 
+    def _offline_changed(self, offline: bool) -> None:
+        self.image_supplement_checkbox.setEnabled(not offline)
+        if offline:
+            self.image_supplement_checkbox.setChecked(False)
+        self.supplement_target_spin.setEnabled(not offline and self.image_supplement_checkbox.isChecked())
+
     def _update_start_enabled(self, *_args) -> None:
         has_sections = any(box.isChecked() for box in self.section_checkboxes.values())
         self.section_hint.setVisible(not has_sections)
@@ -206,8 +249,14 @@ class NewTaskPage(QWidget):
             "use_socialdata_x": self.socialdata_checkbox.isChecked(),
             "use_archive_materials": self.archive_materials_checkbox.isChecked(),
             "archive_range": self.archive_range_combo.currentData(),
+            "use_image_supplement": self.image_supplement_checkbox.isChecked() and not self.offline_checkbox.isChecked(),
+            "supplement_target_images": self.supplement_target_spin.value(),
+            "supplement_sources": [source for source, checkbox in self.supplement_source_checkboxes.items() if checkbox.isChecked()],
             "selected_sections": selected_sections,
         }
+        if payload["use_image_supplement"] and not payload["supplement_sources"]:
+            self.drop_hint.setText("自动补图请至少选择一个来源")
+            return
         if not payload["input_path"].name or not payload["issue_id"]:
             self.drop_hint.setText("请选择 DOCX 文档并填写期号")
             return
