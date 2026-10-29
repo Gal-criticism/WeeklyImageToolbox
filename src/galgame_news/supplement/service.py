@@ -46,6 +46,17 @@ async def supplement_missing(runner, *, task_root, issue, request, event_sink=No
     try:
         from ..tasks.repository import TaskRepository
         repo = TaskRepository(root, create=False) if TaskRepository.is_authoritative(root) else None
+        # Refresh local evidence before calculating deficits. The sync imports
+        # only safely assigned, valid manual images and keeps them unselected.
+        from ..media_sync import reconcile_task
+        inventory_report = await asyncio.to_thread(
+            reconcile_task, root, phase="supplement",
+            cancelled=lambda: token.is_cancelled, timeout=60,
+        )
+        runner.media_inventory_report = inventory_report
+        if not inventory_report.get("complete"):
+            # An incomplete inventory cannot prove the current media deficit.
+            return []
         selected_ids = set(news_ids or [n.id for n in issue.news_items])
         raw = root / "raw"
         for news in issue.news_items:
@@ -67,7 +78,8 @@ async def supplement_missing(runner, *, task_root, issue, request, event_sink=No
                         review_state = json.loads(state_path.read_text(encoding="utf-8"))
                     except Exception:
                         review_state = {}
-                index_paths = [root / "raw" / "image_index.json", root / "image_index.json"]
+                index_paths = [root / "raw" / "image_index.json", root / "image_index.json",
+                               root / "media_sync_overlay.json"]
                 retry_root = root / "retries" / news.id
                 if retry_root.is_dir():
                     index_paths.extend(retry_root.glob("*/image_index.json"))
@@ -144,7 +156,12 @@ async def supplement_missing(runner, *, task_root, issue, request, event_sink=No
                 for c in [*existing_by_id.values(), *pool]:
                     if decisions.get(str(c.id)) == "rejected":
                         continue
+                    if c.signals.get("media_sync_available") is False:
+                        continue
                     if c.curation_status is ImageCurationStatus.INVALID:
+                        continue
+                    if c.signals.get("media_sync") and ImageDownloader.reusable(c):
+                        content.add(str(c.original_sha256 or c.sha256).casefold())
                         continue
                     direct = c.signals.get("supplement_relation")
                     if not direct:

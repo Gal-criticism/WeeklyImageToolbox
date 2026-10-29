@@ -748,7 +748,14 @@ class DesktopController(QObject):
                     except (ValueError, OSError, TypeError) as exc:
                         store.retry_diagnostics.append(diagnose_error(exc, stage="恢复批次", source=str(attempt.path)))
                 self._merge_supplement_fallbacks(session, store.storage_root(record), persist=False)
-                return record, session, list(store.retry_diagnostics)
+                # Full hashing and repository refresh happen inside this
+                # ReviewQuery worker, never on the Qt GUI thread.
+                try:
+                    inventory = session.reconcile_files("review_open")
+                except Exception as exc:
+                    inventory = {"phase": "review_open", "complete": False,
+                                 "error": diagnose_error(exc, stage="素材核对")}
+                return record, session, list(store.retry_diagnostics), inventory
             finally:
                 store.close()
         self._review_loader.request(identity, load)
@@ -768,7 +775,7 @@ class DesktopController(QObject):
         if self.review_page.state_writer.has_failure():
             self.review_page.operation_status.setText("审核决定尚未保存，请重试保存后再打开其他任务")
             return
-        record, session, warnings = result
+        record, session, warnings, inventory = result
         previous = self.review_page.session
         if previous is not None and previous.state_path == session.state_path:
             # Loading validates an independent session. Decisions made while
@@ -781,6 +788,7 @@ class DesktopController(QObject):
         self.review_page.set_session(session)
         self.review_page.set_supplement_controls(bool(self.task_store.load_request_options(record).get("use_image_supplement", False)))
         self.review_page.state_writer.enqueue(session)
+        self.review_page.show_inventory_report(inventory)
         if warnings:
             self.review_page.show_diagnostics(warnings)
         self.review_loaded.emit(session)

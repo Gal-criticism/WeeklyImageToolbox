@@ -177,8 +177,12 @@ class LocalArchiveProvider:
             if not root.is_dir():
                 continue
             from galgame_news.tasks.repository import TaskRepository
+            from galgame_news.media_sync import reconcile_task
+            reconcile_task(root, phase="archive", cancelled=lambda: _cancelled(cancelled), timeout=60)
 
             if TaskRepository.is_authoritative(root):
+                # Reconcile explicitly configured task media before exporting the
+                # repository view, so manually added review files are searchable.
                 image_payload, video_payload, _, _ = TaskRepository(root, create=False).export_review_payloads()
                 for payload, kind in ((image_payload, "image"), (video_payload, "video")):
                     assets.extend(self._assets_from_index_payload(root, self.source_id, payload, kind, root / "task_state.sqlite3", days, now))
@@ -195,6 +199,13 @@ class LocalArchiveProvider:
                     except (OSError, ValueError, UnicodeError):
                         continue
                     assets.extend(self._assets_from_index_payload(root, self.source_id, payload, kind, index_file, days, now))
+            overlay_file = root / "media_sync_overlay.json"
+            if overlay_file.is_file():
+                try:
+                    payload = json.loads(overlay_file.read_text(encoding="utf-8"))
+                    assets.extend(self._assets_from_index_payload(root, self.source_id, payload, "image", overlay_file, days, now))
+                except (OSError, ValueError, UnicodeError):
+                    pass
         by_id = {asset.asset_id: asset for asset in assets}
         return list(by_id.values())
 

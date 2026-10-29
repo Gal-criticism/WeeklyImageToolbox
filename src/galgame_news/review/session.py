@@ -1152,6 +1152,8 @@ class ReviewSession:
         return names
 
     def _source_for(self, candidate: ImageCandidate | VideoCandidate) -> Path | None:
+        if (getattr(candidate, "signals", {}) or {}).get("media_sync_available") is False:
+            return None
         source = self._source_paths.get(str(candidate.id))
         if source is not None and source.is_file():
             return source
@@ -1190,7 +1192,63 @@ class ReviewSession:
         except Exception:
             return None
 
+    def reconcile_files(self, phase: str = "review") -> dict[str, Any]:
+        """Refresh physical evidence without losing unsaved human decisions."""
+        from ..media_sync import reconcile_task
+        report = reconcile_task(self.task_root, phase=phase, timeout=60)
+        self.inventory_report = report
+        if not report.get("complete"):
+            return report
+        from ..tasks.repository import TaskRepository
+        if TaskRepository.is_authoritative(self.task_root):
+            refreshed = type(self).from_output(self.output_dir, task_root=self.task_root,
+                                              state_path=self.state_path)
+            old_hashes = {str(c.id): (c.original_sha256 or c.sha256) for c in self.images}
+            for name in ("images", "videos", "_source_paths", "_raw_types", "_image_by_id",
+                         "_video_by_id", "_repository_candidate_ids"):
+                setattr(self, name, getattr(refreshed, name))
+            for candidate in self.images:
+                key = str(candidate.id)
+                if key not in self._decisions or old_hashes.get(key) != (candidate.original_sha256 or candidate.sha256):
+                    self._decisions[key] = ReviewDecision.PENDING
+                    self._manual_decisions.discard(key)
+            self._pending_cache.clear()
+            self.revision += 1
+        else:
+            # Legacy indexes remain read-only; safely assigned additions live
+            # in the separate reconciliation overlay.
+            overlay = _read_json(self.task_root / "media_sync_overlay.json", {})
+            for row in overlay.get("candidates", []) if isinstance(overlay, dict) else ():
+                candidate, key = self._coerce_image(row)
+                if candidate is None:
+                    continue
+                previous = self._image_by_id.get(key)
+                if previous is not None:
+                    self.images = [candidate if str(c.id) == key else c for c in self.images]
+                else:
+                    self.images.append(candidate)
+                self._image_by_id[key] = candidate
+                source = self._resolve_image_path(candidate, self.output_dir)
+                if source is not None:
+                    self._source_paths[key] = source
+                if key not in self._decisions or (previous and previous.sha256 != candidate.sha256):
+                    self._decisions[key] = ReviewDecision.PENDING
+                    self._manual_decisions.discard(key)
+            self._pending_cache.clear()
+        return report
+
     def export_final(self, *, include_pending: bool = True) -> dict[str, Any]:
+        self.task_root.mkdir(parents=True, exist_ok=True)
+        (self.task_root / "final" / "images").mkdir(parents=True, exist_ok=True)
+        report = self.reconcile_files("before_export")
+        if not report.get("complete"):
+            raise ValueError("素材目录核对未完成，请检查读取权限或文件占用后重试导出")
+        try:
+            return self._export_final_checked(include_pending=include_pending)
+        finally:
+            self.reconcile_files("after_export")
+
+    def _export_final_checked(self, *, include_pending: bool = True) -> dict[str, Any]:
         final_root = self.task_root / "final"
         final_root.mkdir(parents=True, exist_ok=True)
         published = final_root / "images"
@@ -1202,7 +1260,24 @@ class ReviewSession:
             raise ValueError("图片交付目录不能是符号链接")
         previous = _read_json(final_root / "final_manifest.json", {})
         previous_files = previous.get("files", []) if isinstance(previous, dict) else []
-        owned = {value for value in previous_files if isinstance(value, str)} if isinstance(previous_files, list) else set()
+        previous_hashes = previous.get("file_sha256", {}) if isinstance(previous, dict) else {}
+        # A path alone is not proof of ownership: a user may have replaced a
+        # previously exported file in place. Only prune/replace files whose
+        # current bytes still match the hash recorded by our prior export.
+        owned: set[str] = set()
+        if isinstance(previous_files, list) and isinstance(previous_hashes, dict):
+            for value in previous_files:
+                if not isinstance(value, str) or not isinstance(previous_hashes.get(value), str):
+                    continue
+                relative = self._safe_manifest_image_path(value)
+                if relative is None:
+                    continue
+                existing = published / relative
+                try:
+                    if existing.is_file() and not existing.is_symlink() and hashlib.sha256(existing.read_bytes()).hexdigest() == previous_hashes[value]:
+                        owned.add(value)
+                except OSError:
+                    continue
         committed = False
         # Preserve user-added files. Only the files named by the previous
         # manifest are regenerated; repeated export never adds numbered copies.
@@ -1430,12 +1505,23 @@ class ReviewSession:
             "image_count": selected_count,
             "pending_image_count": pending_count,
             "video_count": video_count,
+            "file_sha256": {
+                value: hashlib.sha256((image_root / Path(*Path(value).parts[1:])).read_bytes()).hexdigest()
+                for value in files
+            },
         }
         if archive_assets:
             manifest["archive_assets"] = archive_assets
         if supplement_assets:
             manifest["supplement_assets"] = supplement_assets
         return manifest
+
+    @staticmethod
+    def _safe_manifest_image_path(value: str) -> Path | None:
+        path = Path(value)
+        if path.is_absolute() or path.drive or ".." in path.parts or not path.parts or path.parts[0] != "images":
+            return None
+        return Path(*path.parts[1:])
 
     def _issue_id(self) -> str:
         if self.state_path.suffix == ".sqlite3":

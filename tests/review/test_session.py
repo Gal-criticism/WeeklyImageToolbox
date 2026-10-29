@@ -179,6 +179,40 @@ def test_export_final_uses_x_prefix_and_does_not_modify_raw(tmp_path):
     assert json.loads((output / "image_index.json").read_text(encoding="utf-8")) == raw_before
 
 
+def test_export_preserves_untracked_file_that_conflicts_with_generated_name(tmp_path):
+    candidate = _candidate(tmp_path, "accepted", selected=True)
+    output = _write_output(tmp_path, [candidate])
+    task_root = tmp_path / "task"
+    published = task_root / "final" / "images" / "x1"
+    published.mkdir(parents=True)
+    manual = published / "x1.01.png"
+    manual.write_bytes(b"user-owned bytes")
+    session = ReviewSession.from_output(output, task_root=task_root)
+
+    manifest = session.export_final()
+
+    assert manual.read_bytes() == b"user-owned bytes"
+    assert (published / "x1.01 (2).png").is_file()
+    assert manifest["files"] == ["images/x1/x1.01 (2).png"]
+
+
+def test_export_preserves_manually_replaced_previously_managed_file(tmp_path):
+    candidate = _candidate(tmp_path, "accepted", selected=True)
+    output = _write_output(tmp_path, [candidate])
+    task_root = tmp_path / "task"
+    session = ReviewSession.from_output(output, task_root=task_root)
+    first = session.export_final()
+    managed = task_root / "final" / "images" / "x1" / "x1.01.png"
+    assert first["file_sha256"]["images/x1/x1.01.png"]
+    managed.write_bytes(b"user replacement")
+
+    second = session.export_final()
+
+    assert managed.read_bytes() == b"user replacement"
+    assert (managed.parent / "x1.01 (2).png").is_file()
+    assert second["files"] == ["images/x1/x1.01 (2).png"]
+
+
 def test_export_final_reuses_category_aliases_and_manifest_appearance_order(tmp_path):
     output = tmp_path / "output"
     output.mkdir()

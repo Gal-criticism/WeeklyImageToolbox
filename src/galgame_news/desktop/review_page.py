@@ -379,6 +379,30 @@ class ReviewPage(QWidget):
             self._clear_details()
         self.refresh()
 
+    def show_inventory_report(self, report: dict[str, Any] | None) -> None:
+        """Show a compact summary of the most recent background media scan."""
+        if not report:
+            return
+        timestamp = str(report.get("last_checked_utc") or "未知时间")
+        files = report.get("files", "?")
+        unique = report.get("content_unique", report.get("physical_unique", "?"))
+        usable = report.get("usable_unique", report.get("usable_files", "?"))
+        changes = report.get("changes") or {}
+        def count(value):
+            return len(value) if isinstance(value, (list, tuple, set, dict)) else int(value or 0)
+        changed = sum(count(changes.get(key, 0))
+                      for key in ("added", "removed", "moved", "modified"))
+        state = "完整" if report.get("complete") else "未完成"
+        if report.get("cancelled"):
+            state = "已取消"
+        session = self.session
+        self.export_status.setText(
+            f"素材核对：{state}；扫描 {files} 个文件，物理唯一 {unique} 个，可用 {usable} 个，"
+            f"变化 {changed} 项\n最近扫描（UTC）：{timestamp}\n"
+            f"来源目录：{session.output_dir if session else ''}"
+            f"\n导出目录：{session.task_root / 'final' / 'images' if session else ''}"
+        )
+
     def _news_filter(self) -> str | None:
         item = self.news_list.currentItem()
         value = item.data(0, Qt.ItemDataRole.UserRole) if item else None
@@ -1324,6 +1348,15 @@ class ReviewPage(QWidget):
                 f"\n导出目录：{session.task_root / 'final' / 'images'}"
             )
             self.raw_details.setPlainText(json.dumps(sanitize_diagnostic(manifest), ensure_ascii=False, indent=2))
+            report = getattr(session, "inventory_report", None)
+            if report:
+                self.export_status.setText(
+                    self.export_status.text()
+                    + f"\n最近核对：{report.get('last_checked_utc', '')}；"
+                    + f"实际 {report.get('files', 0)} 个文件；"
+                    + f"可用去重 {report.get('usable_unique', 0)} 项"
+                )
+                self.refresh(preserve_position=True)
         else:
             self.export_status.setText("导出失败，请展开技术详情查看原因")
             self.raw_details.setPlainText(str(sanitize_diagnostic(error)) if error else "导出失败")

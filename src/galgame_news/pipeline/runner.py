@@ -246,6 +246,7 @@ class PipelineRunner:
                     self._event("supplement_failed", result.task_id, request.issue_id,
                         message=f"图片补充失败（{type(exc).__name__}）"))
         # Full assets and indexes remain available for review and recovery.
+        await self._reconcile_task_media(result.task_dir, "end", cancelled=lambda: False)
         return result
 
     async def _resolve_async(self, news, request):
@@ -397,6 +398,8 @@ class PipelineRunner:
         self._emit(sink, failures, self._event(
             "task_started", task_id, request.issue_id, message="pipeline started",
         ))
+        await self._reconcile_task_media(task_dir, "resume" if resumed else "start",
+                                         cancelled=lambda: token.is_cancelled)
         try:
             await token.wait_if_paused_async()
         except (CancellationRequested, asyncio.CancelledError):
@@ -1182,6 +1185,22 @@ class PipelineRunner:
     @staticmethod
     def _rewrite_paths(result, old_root, new_root):
         rebase_asset_paths(result, Path(old_root), Path(new_root))
+
+    @staticmethod
+    async def _reconcile_task_media(root, phase, *, cancelled=None):
+        """Run bounded task media hashing outside the event loop."""
+        if not root:
+            return None
+        try:
+            from ..media_sync import reconcile_task
+            return await asyncio.wait_for(
+                asyncio.to_thread(reconcile_task, Path(root), phase,
+                                  cancelled=cancelled, timeout=60),
+                timeout=65,
+            )
+        except Exception:
+            # Inventory is supplementary and must never fail a pipeline task.
+            return None
 
     async def _cancel(
         self, request, task_id, task_dir, raw_dir, checkpoint_path, issue,
